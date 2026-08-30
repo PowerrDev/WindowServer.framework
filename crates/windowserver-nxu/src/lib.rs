@@ -9,8 +9,11 @@
  * NXU platform backend for WindowServer.framework.
  */
 
+pub mod ffi;
 pub mod framebuffer;
 pub mod platform;
 
 pub use framebuffer::{Framebuffer, FramebufferError};
 pub use platform::{DisplayPlatform, FramebufferInfo, PixelFormat};
+
+pub use ffi::windowserver_nxu_bootstrap;

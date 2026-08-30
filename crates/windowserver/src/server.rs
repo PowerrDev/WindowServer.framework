@@ -1,7 +1,7 @@
-/*!
+/**
  * Copyright (c) 2026 NXU Project. All rights reserved.
  */
-/*!
+/**
  * File:        crates/windowserver/src/server.rs
  *
  * WindowServer state management.
