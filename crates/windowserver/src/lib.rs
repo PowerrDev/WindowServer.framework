@@ -1,9 +1,13 @@
 #![no_std]
 
-//! Platform-independent WindowServer core for sevOS.
-//!
-//! Implementation will be introduced incrementally from the old ArmOS
-//! WindowServer architecture rather than as a direct C-to-Rust translation.
+/*!
+ * Copyright (c) 2026 NXU Project. All rights reserved.
+ */
+/*!
+ * File:        crates/windowserver/src/lib.rs
+ *
+ * Platform-independent WindowServer core for NXU
+ */
 
 pub mod animation;
 pub mod compositor;
@@ -15,3 +19,9 @@ pub mod input;
 pub mod server;
 pub mod surface;
 pub mod window;
+
+pub use compositor::{Compositor, Layer};
+pub use damage::Damage;
+pub use geometry::{Point, Rect, Size};
+pub use surface::{Surface, SurfaceError};
+pub use window::{Window, WindowFlags, WindowId};
