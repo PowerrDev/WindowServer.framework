@@ -1,0 +1,2 @@
+//! Animation subsystem.
+// TODO: Implement.

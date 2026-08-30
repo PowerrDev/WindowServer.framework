@@ -1,0 +1,2 @@
+//! Decorations subsystem.
+// TODO: Implement.
