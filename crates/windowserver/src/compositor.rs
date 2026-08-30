@@ -47,15 +47,21 @@ impl Compositor {
     ) {
         let Some(clip) = damage.intersection(surface_rect(framebuffer)) else { return; };
 
-        fill_rect(framebuffer, clip, self.background);
+        self.begin(framebuffer, clip);
 
         for layer in layers {
-            if !layer.window.flags().visible { continue; }
             self.compose_layer(framebuffer, layer, clip);
         }
     }
 
-    fn compose_layer<'a, 'pixels>(
+    /// Begin a composition pass by clearing the damaged region.
+    pub fn begin(&self, framebuffer: &mut Surface<'_>, damage: Rect) {
+        let Some(clip) = damage.intersection(surface_rect(framebuffer)) else { return; };
+        fill_rect(framebuffer, clip, self.background);
+    }
+
+    /// Compose one layer into an already-initialized composition pass.
+    pub fn compose_layer<'a, 'pixels>(
         &self,
         framebuffer: &mut Surface<'_>,
         layer: &Layer<'a, 'pixels>,
