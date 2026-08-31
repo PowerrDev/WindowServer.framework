@@ -24,7 +24,7 @@ use crate::{Framebuffer, FramebufferInfo, PixelFormat};
 /// `framebuffer` must point to at least `stride * height` writable `u32`
 /// pixels for the duration of this call. The mapping remains owned by NXU.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn windowserver_nxu_bootstrap(
+pub unsafe extern "C" fn bootstrap(
     framebuffer: *mut u32,
     width: u32,
     height: u32,

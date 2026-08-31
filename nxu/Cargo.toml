@@ -1,0 +1,16 @@
+[workspace]
+
+[package]
+name = "windowserver-nxu-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "windowserver_nxu"
+crate-type = ["staticlib"]
+
+[dependencies]
+windowserver-nxu = { path = "../crates/windowserver-nxu" }
+
+[profile.release]
+panic = "abort"

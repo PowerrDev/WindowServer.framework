@@ -16,4 +16,4 @@ pub mod platform;
 pub use framebuffer::{Framebuffer, FramebufferError};
 pub use platform::{DisplayPlatform, FramebufferInfo, PixelFormat};
 
-pub use ffi::windowserver_nxu_bootstrap;
+pub use ffi::bootstrap;
