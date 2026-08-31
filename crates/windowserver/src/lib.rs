@@ -26,6 +26,7 @@ pub mod window;
 pub use compositor::{Compositor, Layer};
 pub use damage::Damage;
 pub use geometry::{Point, Rect, Size};
+pub use input::{PointerButton, PointerEvent, PointerResult, PointerState};
 pub use server::WindowServer;
 pub use surface::{Surface, SurfaceError};
 pub use window::{Window, WindowFlags, WindowId};
