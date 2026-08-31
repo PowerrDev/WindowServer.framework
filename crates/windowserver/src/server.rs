@@ -38,6 +38,7 @@ pub struct WindowServer {
     windows: Vec<ServerWindow>,
     damage: Damage,
     next_window_id: WindowId,
+    focused_window: Option<WindowId>,
 }
 
 impl WindowServer {
@@ -47,6 +48,7 @@ impl WindowServer {
             windows: Vec::new(),
             damage: Damage::new(),
             next_window_id: 1,
+            focused_window: None
         }
     }
 
@@ -54,6 +56,9 @@ impl WindowServer {
     pub fn compositor_mut(&mut self) -> &mut Compositor { &mut self.compositor }
     pub fn window_count(&self) -> usize { self.windows.len() }
     pub fn damage(&self) -> &Damage { &self.damage }
+    pub fn focused_window(&self) -> Option<WindowId> {
+        self.focused_window
+    }
 
     pub fn create_window(&mut self, frame: Rect) -> Result<WindowId, SurfaceError> {
         let pixels = pixel_len(frame.width(), frame.height())?;
@@ -82,6 +87,47 @@ impl WindowServer {
     pub fn window_mut(&mut self, id: WindowId) -> Option<&mut Window> {
         let index = self.window_index(id)?;
         Some(&mut self.windows[index].window)
+    }
+
+    pub fn hit_test(&self, point: Point) -> Option<WindowId> {
+        for entry in self.windows.iter().rev() {
+            let frame = entry.window.frame();
+
+            let x = point.x;
+            let y = point.y;
+
+            if x >= frame.x()
+                && y >= frame.y()
+                && x < frame.right() as i32
+                && y < frame.bottom() as i32
+            {
+                return Some(entry.window.id());
+            }
+        }
+
+        None
+    }
+
+    pub fn focus_window(&mut self, id: WindowId) -> bool {
+        if self.window_index(id).is_none() {
+            return false;
+        }
+
+        let previous = self.focused_window;
+
+        if previous == Some(id) {
+            return true;
+        }
+
+        if let Some(previous_id) = previous {
+            if let Some(window) = self.window(previous_id) {
+                self.damage.add(window.frame());
+            }
+        }
+
+        self.focused_window = Some(id);
+
+        self.bring_to_front(id)
     }
 
     pub fn move_window(&mut self, id: WindowId, position: Point) -> bool {
@@ -199,5 +245,75 @@ mod tests {
         server.present(&mut framebuffer).unwrap();
 
         assert_eq!(framebuffer.pixel(2, 2), Some(0xFFFF_0000));
+    }
+
+    #[test]
+    fn hit_test_returns_frontmost_window() {
+        let mut server = WindowServer::new(0xFF00_0000);
+
+        let back = server
+            .create_window(Rect::new(1, 1, 6, 6))
+            .unwrap();
+
+        let front = server
+            .create_window(Rect::new(3, 3, 6, 6))
+            .unwrap();
+
+        assert_eq!(
+            server.hit_test(Point::new(2, 2)),
+            Some(back)
+        );
+
+        assert_eq!(
+            server.hit_test(Point::new(4, 4)),
+            Some(front)
+        );
+
+        assert_eq!(
+            server.hit_test(Point::new(20, 20)),
+            None
+        );
+    }
+
+    #[test]
+    fn focus_window_changes_focus_and_z_order() {
+        let mut server = WindowServer::new(0xFF00_0000);
+
+        let first = server
+            .create_window(Rect::new(1, 1, 4, 4))
+            .unwrap();
+
+        let second = server
+            .create_window(Rect::new(1, 1, 4, 4))
+            .unwrap();
+
+        assert_eq!(server.focused_window(), None);
+
+        assert!(server.focus_window(first));
+
+        assert_eq!(server.focused_window(), Some(first));
+
+        assert!(server.focus_window(second));
+
+        assert_eq!(server.focused_window(), Some(second));
+
+        server.fill_window(first, 0xFFFF_0000);
+        server.fill_window(second, 0xFF00_FF00);
+
+        let mut pixels = [0u32; 64];
+
+        let mut framebuffer = Surface::new(
+            &mut pixels,
+            8,
+            8,
+        )
+        .unwrap();
+
+        server.present(&mut framebuffer).unwrap();
+
+        assert_eq!(
+            framebuffer.pixel(2, 2),
+            Some(0xFF00_FF00)
+        );
     }
 }
