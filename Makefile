@@ -4,8 +4,9 @@ check:
 	cargo check --workspace
 
 NXU_TARGET ?= aarch64-unknown-none-softfloat
-NXU_MANIFEST := nxu/Cargo.toml
-NXU_ARCHIVE := nxu/target/$(NXU_TARGET)/release/libwindowserver_nxu.a
+NXU_MANIFEST := crates/windowserver-nxu/Cargo.toml
+NXU_ARCHIVE := target/$(NXU_TARGET)/release/libwindowserver_nxu.a
+BUILD ?= BUILD
 
 nxu:
 	cargo build \
@@ -13,8 +14,8 @@ nxu:
 		--release \
 		--target $(NXU_TARGET)
 
-	mkdir -p build
+	mkdir -p $(BUILD)
 
-	cp $(NXU_ARCHIVE) build/libWindowServer.a
+	cp $(NXU_ARCHIVE) $(BUILD)/libWindowServer.a
 
-	cp crates/WindowServerNXU.h build/WindowServerNXU.h
+

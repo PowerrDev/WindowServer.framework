@@ -95,7 +95,11 @@ impl PointerState {
         self.position = position;
     }
 
-    pub fn press(&mut self, button: PointerButton, window: Option<WindowId>) {
+    pub fn press(
+        &mut self,
+        button: PointerButton,
+        window: Option<WindowId>,
+    ) {
         self.pressed_button = Some(button);
         self.captured_window = window;
     }

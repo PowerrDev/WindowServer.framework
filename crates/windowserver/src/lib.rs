@@ -24,6 +24,8 @@ pub mod surface;
 pub mod window;
 
 pub use compositor::{Compositor, Layer};
+pub use cursor::Cursor;
+pub use decorations::{Decorations, WindowHit};
 pub use damage::Damage;
 pub use geometry::{Point, Rect, Size};
 pub use input::{PointerButton, PointerEvent, PointerResult, PointerState};

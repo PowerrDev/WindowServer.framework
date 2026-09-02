@@ -4,3 +4,6 @@ members = [
     "crates/windowserver",
     "crates/windowserver-nxu",
 ]
+
+[profile.release]
+panic = "abort"

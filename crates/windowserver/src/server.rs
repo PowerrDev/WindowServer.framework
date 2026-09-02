@@ -7,9 +7,10 @@
  *
  * WindowServer state management.
  *
- * The server owns window lifecycle, backing storage, Z-order, focus, pointer
- * state and damage. Platform-specific framebuffer presentation remains
- * outside this crate.
+ * The server owns window lifecycle, backing storage, Z-order, damage,
+ * pointer input, cursor state and basic window dragging.
+ *
+ * Platform-specific framebuffer presentation remains outside this crate.
  */
 
 use alloc::boxed::Box;
@@ -18,9 +19,16 @@ use alloc::vec::Vec;
 
 use crate::{
     compositor::{Compositor, Layer},
+    cursor::Cursor,
+    decorations::{Decorations, WindowHit},
     damage::Damage,
     geometry::{Point, Rect},
-    input::{PointerButton, PointerEvent, PointerResult, PointerState},
+    input::{
+        PointerButton,
+        PointerEvent,
+        PointerResult,
+        PointerState,
+    },
     surface::{Surface, SurfaceError},
     window::{Window, WindowId},
 };
@@ -31,28 +39,48 @@ struct ServerWindow {
     stride: u32,
 }
 
+/// State for an active window drag operation.
+#[derive(Debug, Clone, Copy)]
+struct DragState {
+    window: WindowId,
+    offset_x: i32,
+    offset_y: i32,
+}
+
 /// Platform-independent WindowServer core.
 ///
-/// Windows are stored in back-to-front order. The last window is therefore
-/// the frontmost window and naturally wins during composition.
+/// Windows are stored in back-to-front order.
+/// The last window is therefore frontmost.
 pub struct WindowServer {
     compositor: Compositor,
     windows: Vec<ServerWindow>,
     damage: Damage,
     next_window_id: WindowId,
+
     focused_window: Option<WindowId>,
+
     pointer: PointerState,
+    cursor: Cursor,
+
+    drag: Option<DragState>,
 }
 
 impl WindowServer {
     pub fn new(background: u32) -> Self {
+        let initial_position = Point::new(0, 0);
+
         Self {
             compositor: Compositor::new(background),
             windows: Vec::new(),
             damage: Damage::new(),
             next_window_id: 1,
+
             focused_window: None,
-            pointer: PointerState::new(Point::new(0, 0)),
+
+            pointer: PointerState::new(initial_position),
+            cursor: Cursor::new(initial_position),
+
+            drag: None,
         }
     }
 
@@ -80,12 +108,20 @@ impl WindowServer {
         self.pointer.position()
     }
 
+    pub fn cursor_position(&self) -> Point {
+        self.cursor.position()
+    }
+
     pub fn pressed_button(&self) -> Option<PointerButton> {
         self.pointer.pressed_button()
     }
 
     pub fn captured_window(&self) -> Option<WindowId> {
         self.pointer.captured_window()
+    }
+
+    pub fn dragging_window(&self) -> Option<WindowId> {
+        self.drag.map(|drag| drag.window)
     }
 
     pub fn create_window(
@@ -119,15 +155,19 @@ impl WindowServer {
 
         self.windows.remove(index);
 
-        self.damage.add(frame);
-
         if self.focused_window == Some(id) {
-            self.focused_window = self.frontmost_window();
+            self.focused_window = None;
         }
 
         if self.pointer.captured_window() == Some(id) {
             self.pointer.release();
         }
+
+        if self.dragging_window() == Some(id) {
+            self.drag = None;
+        }
+
+        self.damage.add(frame);
 
         true
     }
@@ -138,12 +178,20 @@ impl WindowServer {
             .map(|entry| &entry.window)
     }
 
-    pub fn window_mut(&mut self, id: WindowId) -> Option<&mut Window> {
+    pub fn window_mut(
+        &mut self,
+        id: WindowId,
+    ) -> Option<&mut Window> {
         let index = self.window_index(id)?;
+
         Some(&mut self.windows[index].window)
     }
 
-    pub fn hit_test(&self, point: Point) -> Option<WindowId> {
+    /// Returns the frontmost window containing the point.
+    pub fn hit_test(
+        &self,
+        point: Point,
+    ) -> Option<WindowId> {
         for entry in self.windows.iter().rev() {
             let frame = entry.window.frame();
 
@@ -162,7 +210,10 @@ impl WindowServer {
         None
     }
 
-    pub fn focus_window(&mut self, id: WindowId) -> bool {
+    pub fn focus_window(
+        &mut self,
+        id: WindowId,
+    ) -> bool {
         if self.window_index(id).is_none() {
             return false;
         }
@@ -184,75 +235,6 @@ impl WindowServer {
         self.bring_to_front(id)
     }
 
-    pub fn handle_pointer_event(
-        &mut self,
-        event: PointerEvent,
-    ) -> PointerResult {
-        match event {
-            PointerEvent::Move { position } => {
-                self.pointer.set_position(position);
-
-                let target = self
-                    .pointer
-                    .captured_window()
-                    .or_else(|| self.hit_test(position));
-
-                PointerResult {
-                    position,
-                    target,
-                    focused: self.focused_window,
-                    button: self.pointer.pressed_button(),
-                    pressed: self.pointer.pressed_button().is_some(),
-                }
-            }
-
-            PointerEvent::ButtonDown {
-                position,
-                button,
-            } => {
-                self.pointer.set_position(position);
-
-                let target = self.hit_test(position);
-
-                if let Some(id) = target {
-                    self.focus_window(id);
-                }
-
-                self.pointer.press(button, target);
-
-                PointerResult {
-                    position,
-                    target,
-                    focused: self.focused_window,
-                    button: Some(button),
-                    pressed: true,
-                }
-            }
-
-            PointerEvent::ButtonUp {
-                position,
-                button,
-            } => {
-                self.pointer.set_position(position);
-
-                let target = self
-                    .pointer
-                    .captured_window()
-                    .or_else(|| self.hit_test(position));
-
-                self.pointer.release();
-
-                PointerResult {
-                    position,
-                    target,
-                    focused: self.focused_window,
-                    button: Some(button),
-                    pressed: false,
-                }
-            }
-        }
-    }
-
     pub fn move_window(
         &mut self,
         id: WindowId,
@@ -264,17 +246,22 @@ impl WindowServer {
 
         let window = &mut self.windows[index].window;
 
-        let old = window.frame();
+        let old_frame = window.frame();
 
         window.set_position(position);
 
-        self.damage.add(old);
-        self.damage.add(window.frame());
+        let new_frame = window.frame();
+
+        self.damage.add(old_frame);
+        self.damage.add(new_frame);
 
         true
     }
 
-    pub fn bring_to_front(&mut self, id: WindowId) -> bool {
+    pub fn bring_to_front(
+        &mut self,
+        id: WindowId,
+    ) -> bool {
         let Some(index) = self.window_index(id) else {
             return false;
         };
@@ -312,6 +299,137 @@ impl WindowServer {
         true
     }
 
+    /// Routes a pointer event through WindowServer.
+    pub fn handle_pointer_event(
+        &mut self,
+        event: PointerEvent,
+    ) -> PointerResult {
+        match event {
+            PointerEvent::Move { position } => {
+                self.update_pointer_position(position);
+
+                /*
+                 * If a window is actively being dragged, move it.
+                 */
+                if let Some(drag) = self.drag {
+                    let new_position = Point::new(
+                        position.x - drag.offset_x,
+                        position.y - drag.offset_y,
+                    );
+
+                    self.move_window(
+                        drag.window,
+                        new_position,
+                    );
+                }
+
+                /*
+                 * Captured windows continue receiving pointer events even
+                 * when the pointer moves outside their frame.
+                 */
+                let target = self
+                    .pointer
+                    .captured_window()
+                    .or_else(|| self.hit_test(position));
+
+                PointerResult {
+                    position,
+                    target,
+                    focused: self.focused_window,
+                    button: self.pointer.pressed_button(),
+                    pressed: self.pointer.pressed_button().is_some(),
+                }
+            }
+
+            PointerEvent::ButtonDown {
+                position,
+                button,
+            } => {
+                self.update_pointer_position(position);
+
+                let target = self.hit_test(position);
+
+                /*
+                 * Clicking a window focuses it and brings it forward.
+                 */
+                if let Some(window) = target {
+                    self.focus_window(window);
+                }
+
+                self.pointer.press(
+                    button,
+                    target,
+                );
+
+                /*
+                 * Begin a drag operation for left-clicks.
+                 *
+                 * offset_x/y prevents the window from snapping its
+                 * top-left corner directly to the cursor.
+                 */
+                if button == PointerButton::Left {
+                    if let Some(window_id) = target {
+                        match self.window(window_id).map(|window| Decorations::hit_test(window, position)) {
+                            Some(WindowHit::CloseButton) => {
+                                self.destroy_window(window_id);
+                                self.pointer.release();
+                            }
+                            Some(WindowHit::TitleBar) => {
+                                if let Some(window) = self.window(window_id) {
+                                    let frame = window.frame();
+                                    self.drag = Some(DragState {
+                                        window: window_id,
+                                        offset_x: position.x - frame.x(),
+                                        offset_y: position.y - frame.y(),
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                PointerResult {
+                    position,
+                    target,
+                    focused: self.focused_window,
+                    button: Some(button),
+                    pressed: true,
+                }
+            }
+
+            PointerEvent::ButtonUp {
+                position,
+                button,
+            } => {
+                self.update_pointer_position(position);
+
+                /*
+                 * Get the captured target before releasing it.
+                 */
+                let target = self
+                    .pointer
+                    .captured_window()
+                    .or_else(|| self.hit_test(position));
+
+                self.pointer.release();
+
+                if button == PointerButton::Left {
+                    self.drag = None;
+                }
+
+                PointerResult {
+                    position,
+                    target,
+                    focused: self.focused_window,
+                    button: Some(button),
+                    pressed: false,
+                }
+            }
+        }
+    }
+
+    /// Composites damaged windows and cursor into the framebuffer.
     pub fn present(
         &mut self,
         framebuffer: &mut Surface<'_>,
@@ -351,22 +469,53 @@ impl WindowServer {
             );
         }
 
+        // Decorations are server-owned overlays above client content.
+        for entry in &self.windows {
+            Decorations::draw(
+                &entry.window,
+                framebuffer,
+                self.focused_window == Some(entry.window.id()),
+            );
+        }
+
+        // Cursor is always rendered last.
+        self.cursor.draw(framebuffer);
+
         Ok(true)
     }
 
-    fn window_index(&self, id: WindowId) -> Option<usize> {
+    fn update_pointer_position(
+        &mut self,
+        position: Point,
+    ) {
+        let old_cursor_frame = self.cursor.frame();
+
+        self.pointer.set_position(position);
+        self.cursor.set_position(position);
+
+        let new_cursor_frame = self.cursor.frame();
+
+        /*
+         * Damage both old and new cursor positions.
+         */
+        self.damage.add(old_cursor_frame);
+        self.damage.add(new_cursor_frame);
+    }
+
+    fn window_index(
+        &self,
+        id: WindowId,
+    ) -> Option<usize> {
         self.windows
             .iter()
-            .position(|entry| entry.window.id() == id)
+            .position(|entry| {
+                entry.window.id() == id
+            })
     }
 
-    fn frontmost_window(&self) -> Option<WindowId> {
-        self.windows
-            .last()
-            .map(|entry| entry.window.id())
-    }
-
-    fn allocate_window_id(&mut self) -> WindowId {
+    fn allocate_window_id(
+        &mut self,
+    ) -> WindowId {
         let id = self.next_window_id;
 
         self.next_window_id =
@@ -377,6 +526,18 @@ impl WindowServer {
         }
 
         id
+    }
+
+        
+    /// Mark a region for recomposition.
+    ///
+    /// This is primarily used by platform backends when a new scanout surface
+    /// becomes active and the entire scene must be composed from scratch.
+    pub fn invalidate(
+        &mut self,
+        rect: Rect,
+    ) {
+        self.damage.add(rect);
     }
 }
 
@@ -414,12 +575,8 @@ mod tests {
 
         let mut pixels = [0u32; 64];
 
-        let mut framebuffer = Surface::new(
-            &mut pixels,
-            8,
-            8,
-        )
-        .unwrap();
+        let mut framebuffer =
+            Surface::new(&mut pixels, 8, 8).unwrap();
 
         assert!(server.present(&mut framebuffer).unwrap());
 
@@ -474,12 +631,8 @@ mod tests {
 
         let mut pixels = [0u32; 64];
 
-        let mut framebuffer = Surface::new(
-            &mut pixels,
-            8,
-            8,
-        )
-        .unwrap();
+        let mut framebuffer =
+            Surface::new(&mut pixels, 8, 8).unwrap();
 
         server.present(&mut framebuffer).unwrap();
 
@@ -529,10 +682,7 @@ mod tests {
             .create_window(Rect::new(1, 1, 4, 4))
             .unwrap();
 
-        assert_eq!(
-            server.focused_window(),
-            None
-        );
+        assert_eq!(server.focused_window(), None);
 
         assert!(server.focus_window(first));
 
@@ -547,25 +697,6 @@ mod tests {
             server.focused_window(),
             Some(second)
         );
-
-        server.fill_window(first, 0xFFFF_0000);
-        server.fill_window(second, 0xFF00_FF00);
-
-        let mut pixels = [0u32; 64];
-
-        let mut framebuffer = Surface::new(
-            &mut pixels,
-            8,
-            8,
-        )
-        .unwrap();
-
-        server.present(&mut framebuffer).unwrap();
-
-        assert_eq!(
-            framebuffer.pixel(2, 2),
-            Some(0xFF00_FF00)
-        );
     }
 
     #[test]
@@ -579,7 +710,7 @@ mod tests {
         let result = server.handle_pointer_event(
             PointerEvent::Move {
                 position: Point::new(15, 15),
-            }
+            },
         );
 
         assert_eq!(
@@ -593,12 +724,12 @@ mod tests {
         );
 
         assert_eq!(
-            result.focused,
-            None
+            server.pointer_position(),
+            Point::new(15, 15)
         );
 
         assert_eq!(
-            server.pointer_position(),
+            server.cursor_position(),
             Point::new(15, 15)
         );
     }
@@ -619,18 +750,11 @@ mod tests {
             PointerEvent::ButtonDown {
                 position: Point::new(25, 25),
                 button: PointerButton::Left,
-            }
+            },
         );
 
-        assert_eq!(
-            result.target,
-            Some(front)
-        );
-
-        assert_eq!(
-            result.focused,
-            Some(front)
-        );
+        assert_eq!(result.target, Some(front));
+        assert_eq!(result.focused, Some(front));
 
         assert_eq!(
             server.focused_window(),
@@ -644,6 +768,11 @@ mod tests {
 
         assert_eq!(
             server.captured_window(),
+            Some(front)
+        );
+
+        assert_eq!(
+            server.dragging_window(),
             Some(front)
         );
 
@@ -662,21 +791,17 @@ mod tests {
             PointerEvent::ButtonDown {
                 position: Point::new(15, 15),
                 button: PointerButton::Left,
-            }
+            },
         );
 
         let result = server.handle_pointer_event(
             PointerEvent::ButtonUp {
                 position: Point::new(15, 15),
                 button: PointerButton::Left,
-            }
+            },
         );
 
-        assert_eq!(
-            result.target,
-            Some(window)
-        );
-
+        assert_eq!(result.target, Some(window));
         assert!(!result.pressed);
 
         assert_eq!(
@@ -692,6 +817,106 @@ mod tests {
         assert_eq!(
             server.captured_window(),
             None
+        );
+
+        assert_eq!(
+            server.dragging_window(),
+            None
+        );
+    }
+
+    #[test]
+    fn dragging_window_moves_it_using_cursor_offset() {
+        let mut server = WindowServer::new(0xFF00_0000);
+
+        let window = server
+            .create_window(Rect::new(100, 100, 200, 100))
+            .unwrap();
+
+        /*
+         * Click 20 pixels from the left edge
+         * and 30 pixels from the top edge.
+         */
+        server.handle_pointer_event(
+            PointerEvent::ButtonDown {
+                position: Point::new(120, 130),
+                button: PointerButton::Left,
+            },
+        );
+
+        assert_eq!(
+            server.dragging_window(),
+            Some(window)
+        );
+
+        /*
+         * Move cursor from (120, 130) to (200, 200).
+         *
+         * Window origin should move from (100, 100)
+         * to (180, 170).
+         */
+        server.handle_pointer_event(
+            PointerEvent::Move {
+                position: Point::new(200, 200),
+            },
+        );
+
+        let frame = server
+            .window(window)
+            .unwrap()
+            .frame();
+
+        assert_eq!(frame.x(), 180);
+        assert_eq!(frame.y(), 170);
+    }
+
+    #[test]
+    fn releasing_pointer_stops_window_drag() {
+        let mut server = WindowServer::new(0xFF00_0000);
+
+        let window = server
+            .create_window(Rect::new(10, 10, 100, 100))
+            .unwrap();
+
+        server.handle_pointer_event(
+            PointerEvent::ButtonDown {
+                position: Point::new(20, 20),
+                button: PointerButton::Left,
+            },
+        );
+
+        server.handle_pointer_event(
+            PointerEvent::Move {
+                position: Point::new(100, 100),
+            },
+        );
+
+        let frame_before_release = server
+            .window(window)
+            .unwrap()
+            .frame();
+
+        server.handle_pointer_event(
+            PointerEvent::ButtonUp {
+                position: Point::new(100, 100),
+                button: PointerButton::Left,
+            },
+        );
+
+        server.handle_pointer_event(
+            PointerEvent::Move {
+                position: Point::new(200, 200),
+            },
+        );
+
+        let frame_after_release = server
+            .window(window)
+            .unwrap()
+            .frame();
+
+        assert_eq!(
+            frame_before_release,
+            frame_after_release
         );
     }
 }

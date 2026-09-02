@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["rlib"]
+crate-type = ["staticlib"]
 
 [dependencies]
 windowserver = { path = "../windowserver" }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }

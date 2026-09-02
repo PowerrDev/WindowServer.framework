@@ -1,9 +1,11 @@
-# Rust
+/BUILD/
 /target/
-
-# IDE
+**/target/
 .idea/
 .vscode/
-
-# macOS
 .DS_Store
+.AppleDouble
+._*
+*.swp
+*.swo
+*~
