@@ -128,7 +128,7 @@ pub unsafe extern "C" fn windowserver_nxu_init(
         first,
         &BUILTIN_FONT,
         Point::new(24, 50),
-        "NXU WindowServer",
+        "Welcome to sevOS!",
         0xFFFF_FFFF,
     );
 
