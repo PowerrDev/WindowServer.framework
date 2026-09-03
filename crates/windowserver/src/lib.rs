@@ -21,7 +21,9 @@ pub mod geometry;
 pub mod input;
 pub mod server;
 pub mod surface;
+pub mod font;
 pub mod window;
+pub mod text;
 
 pub use compositor::{Compositor, Layer};
 pub use cursor::Cursor;

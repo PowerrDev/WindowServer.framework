@@ -39,7 +39,7 @@ impl From<SurfaceError> for FramebufferError {
     fn from(error: SurfaceError) -> Self { Self::Surface(error) }
 }
 
-/// A non-owning adapter around an NXU linear scanout framebuffer.
+// A non-owning adapter around an NXU linear scanout framebuffer.
 #[derive(Debug, Clone, Copy)]
 pub struct Framebuffer {
     info: FramebufferInfo,
@@ -64,10 +64,10 @@ impl Framebuffer {
     pub const fn height(&self) -> u32 { self.info.height }
     pub const fn stride(&self) -> u32 { self.info.stride }
 
-    /// Temporarily exposes the platform scanout as a WindowServer surface.
-    ///
-    /// The closure prevents callers from retaining a `Surface` beyond the
-    /// framebuffer borrow and makes the backend boundary explicit.
+    // Temporarily exposes the platform scanout as a WindowServer surface.
+    //
+    // The closure prevents callers from retaining a `Surface` beyond the
+    // framebuffer borrow and makes the backend boundary explicit.
     pub fn with_surface<R>(
         &mut self,
         operation: impl FnOnce(&mut Surface<'_>) -> R,

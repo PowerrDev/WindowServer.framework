@@ -18,16 +18,16 @@ pub enum PixelFormat {
     Argb8888,
 }
 
-/// Serializable framebuffer metadata.
-///
-/// Unlike `FramebufferInfo`, this type does not contain a raw pointer. It is
-/// therefore suitable for storage inside synchronized global runtime state.
-///
-/// The actual pointer is reconstructed only at the platform boundary where
-/// framebuffer access occurs.
+// Serializable framebuffer metadata.
+//
+// Unlike `FramebufferInfo`, this type does not contain a raw pointer. It is
+// therefore suitable for storage inside synchronized global runtime state.
+//
+// The actual pointer is reconstructed only at the platform boundary where
+// framebuffer access occurs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramebufferDescriptor {
-    /// Linear scanout address supplied by NXU.
+    // Linear scanout address supplied by NXU.
     pub address: usize,
 
     pub width: u32,
@@ -53,9 +53,9 @@ impl FramebufferDescriptor {
         }
     }
 
-    /// Reconstruct framebuffer metadata for platform access.
-    ///
-    /// Returns `None` when the stored address is null.
+    // Reconstruct framebuffer metadata for platform access.
+    //
+    // Returns `None` when the stored address is null.
     pub fn framebuffer_info(self) -> Option<FramebufferInfo> {
         let address = NonNull::new(self.address as *mut u32)?;
 
@@ -69,12 +69,12 @@ impl FramebufferDescriptor {
     }
 }
 
-/// Runtime framebuffer mapping.
-///
-/// This represents an actual linear ARGB8888 framebuffer and deliberately
-/// retains its non-null pointer type. Pointer-bearing framebuffer state should
-/// remain at the platform boundary rather than being stored directly in global
-/// synchronized runtime state.
+// Runtime framebuffer mapping.
+//
+// This represents an actual linear ARGB8888 framebuffer and deliberately
+// retains its non-null pointer type. Pointer-bearing framebuffer state should
+// remain at the platform boundary rather than being stored directly in global
+// synchronized runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramebufferInfo {
     pub address: NonNull<u32>,
@@ -101,7 +101,7 @@ impl FramebufferInfo {
         }
     }
 
-    /// Returns a pointer-free descriptor suitable for persistent runtime state.
+    // Returns a pointer-free descriptor suitable for persistent runtime state.
     pub fn descriptor(self) -> FramebufferDescriptor {
         FramebufferDescriptor {
             address: self.address.as_ptr() as usize,
@@ -123,9 +123,9 @@ impl From<FramebufferInfo> for FramebufferDescriptor {
     }
 }
 
-/// NXU display implementations expose their current linear scanout through
-/// this trait. `windowserver-nxu` does not own the driver or presentation
-/// clock.
+// NXU display implementations expose their current linear scanout through
+// this trait. `windowserver-nxu` does not own the driver or presentation
+// clock.
 pub trait DisplayPlatform {
     fn framebuffer(&mut self) -> Option<FramebufferInfo>;
     fn present(&mut self);

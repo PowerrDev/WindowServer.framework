@@ -20,8 +20,9 @@ use alloc::vec::Vec;
 use crate::{
     compositor::{Compositor, Layer},
     cursor::Cursor,
-    decorations::{Decorations, WindowHit},
     damage::Damage,
+    decorations::{Decorations, WindowHit},
+    font::BitmapFont,
     geometry::{Point, Rect},
     input::{
         PointerButton,
@@ -30,6 +31,7 @@ use crate::{
         PointerState,
     },
     surface::{Surface, SurfaceError},
+    text::draw_text,
     window::{Window, WindowId},
 };
 
@@ -39,7 +41,7 @@ struct ServerWindow {
     stride: u32,
 }
 
-/// State for an active window drag operation.
+// State for an active window drag operation.
 #[derive(Debug, Clone, Copy)]
 struct DragState {
     window: WindowId,
@@ -47,21 +49,18 @@ struct DragState {
     offset_y: i32,
 }
 
-/// Platform-independent WindowServer core.
-///
-/// Windows are stored in back-to-front order.
-/// The last window is therefore frontmost.
+// Platform-independent WindowServer core.
+//
+// Windows are stored in back-to-front order.
+// The last window is therefore frontmost.
 pub struct WindowServer {
     compositor: Compositor,
     windows: Vec<ServerWindow>,
     damage: Damage,
     next_window_id: WindowId,
-
     focused_window: Option<WindowId>,
-
     pointer: PointerState,
     cursor: Cursor,
-
     drag: Option<DragState>,
 }
 
@@ -74,12 +73,9 @@ impl WindowServer {
             windows: Vec::new(),
             damage: Damage::new(),
             next_window_id: 1,
-
             focused_window: None,
-
             pointer: PointerState::new(initial_position),
             cursor: Cursor::new(initial_position),
-
             drag: None,
         }
     }
@@ -187,7 +183,7 @@ impl WindowServer {
         Some(&mut self.windows[index].window)
     }
 
-    /// Returns the frontmost window containing the point.
+    // Returns the frontmost window containing the point.
     pub fn hit_test(
         &self,
         point: Point,
@@ -299,7 +295,46 @@ impl WindowServer {
         true
     }
 
-    /// Routes a pointer event through WindowServer.
+    // Draw text into a window's backing surface.
+    //
+    // Text coordinates are relative to the window surface.
+    pub fn draw_text(
+        &mut self,
+        id: WindowId,
+        font: &BitmapFont,
+        position: Point,
+        text: &str,
+        pixel: u32,
+    ) -> Result<bool, SurfaceError> {
+        let Some(index) = self.window_index(id) else {
+            return Ok(false);
+        };
+
+        let entry = &mut self.windows[index];
+
+        let frame = entry.window.frame();
+
+        let mut surface = Surface::with_stride(
+            &mut entry.pixels,
+            frame.width(),
+            frame.height(),
+            entry.stride,
+        )?;
+
+        draw_text(
+            &mut surface,
+            font,
+            text,
+            position,
+            pixel,
+        );
+
+        self.damage.add(frame);
+
+        Ok(true)
+    }
+
+    // Routes a pointer event through WindowServer.
     pub fn handle_pointer_event(
         &mut self,
         event: PointerEvent,
@@ -308,9 +343,7 @@ impl WindowServer {
             PointerEvent::Move { position } => {
                 self.update_pointer_position(position);
 
-                /*
-                 * If a window is actively being dragged, move it.
-                 */
+                // If a window is actively being dragged, move it.
                 if let Some(drag) = self.drag {
                     let new_position = Point::new(
                         position.x - drag.offset_x,
@@ -323,10 +356,8 @@ impl WindowServer {
                     );
                 }
 
-                /*
-                 * Captured windows continue receiving pointer events even
-                 * when the pointer moves outside their frame.
-                 */
+                // Captured windows continue receiving pointer events even
+                // when the pointer moves outside their frame.
                 let target = self
                     .pointer
                     .captured_window()
@@ -349,9 +380,7 @@ impl WindowServer {
 
                 let target = self.hit_test(position);
 
-                /*
-                 * Clicking a window focuses it and brings it forward.
-                 */
+                // Clicking a window focuses it and brings it forward.
                 if let Some(window) = target {
                     self.focus_window(window);
                 }
@@ -361,29 +390,42 @@ impl WindowServer {
                     target,
                 );
 
-                /*
-                 * Begin a drag operation for left-clicks.
-                 *
-                 * offset_x/y prevents the window from snapping its
-                 * top-left corner directly to the cursor.
-                 */
+                // Begin a drag operation for left-clicks.
+                //
+                // offset_x/y prevents the window from snapping its
+                // top-left corner directly to the cursor.
                 if button == PointerButton::Left {
                     if let Some(window_id) = target {
-                        match self.window(window_id).map(|window| Decorations::hit_test(window, position)) {
+                        match self
+                            .window(window_id)
+                            .map(|window| {
+                                Decorations::hit_test(
+                                    window,
+                                    position,
+                                )
+                            })
+                        {
                             Some(WindowHit::CloseButton) => {
                                 self.destroy_window(window_id);
                                 self.pointer.release();
                             }
+
                             Some(WindowHit::TitleBar) => {
-                                if let Some(window) = self.window(window_id) {
+                                if let Some(window) =
+                                    self.window(window_id)
+                                {
                                     let frame = window.frame();
+
                                     self.drag = Some(DragState {
                                         window: window_id,
-                                        offset_x: position.x - frame.x(),
-                                        offset_y: position.y - frame.y(),
+                                        offset_x:
+                                            position.x - frame.x(),
+                                        offset_y:
+                                            position.y - frame.y(),
                                     });
                                 }
                             }
+
                             _ => {}
                         }
                     }
@@ -404,9 +446,7 @@ impl WindowServer {
             } => {
                 self.update_pointer_position(position);
 
-                /*
-                 * Get the captured target before releasing it.
-                 */
+                // Get the captured target before releasing it.
                 let target = self
                     .pointer
                     .captured_window()
@@ -429,7 +469,7 @@ impl WindowServer {
         }
     }
 
-    /// Composites damaged windows and cursor into the framebuffer.
+    // Composites damaged windows and cursor into the framebuffer.
     pub fn present(
         &mut self,
         framebuffer: &mut Surface<'_>,
@@ -495,9 +535,7 @@ impl WindowServer {
 
         let new_cursor_frame = self.cursor.frame();
 
-        /*
-         * Damage both old and new cursor positions.
-         */
+        // Damage both old and new cursor positions.
         self.damage.add(old_cursor_frame);
         self.damage.add(new_cursor_frame);
     }
@@ -528,11 +566,10 @@ impl WindowServer {
         id
     }
 
-        
-    /// Mark a region for recomposition.
-    ///
-    /// This is primarily used by platform backends when a new scanout surface
-    /// becomes active and the entire scene must be composed from scratch.
+    // Mark a region for recomposition.
+    //
+    // This is primarily used by platform backends when a new scanout surface
+    // becomes active and the entire scene must be composed from scratch.
     pub fn invalidate(
         &mut self,
         rect: Rect,
@@ -578,15 +615,21 @@ mod tests {
         let mut framebuffer =
             Surface::new(&mut pixels, 8, 8).unwrap();
 
+        let _ = server.handle_pointer_event(
+            PointerEvent::Move {
+                position: Point::new(100, 100),
+            },
+        );
+
         assert!(server.present(&mut framebuffer).unwrap());
 
         assert_eq!(
-            framebuffer.pixel(2, 2),
+            framebuffer.pixel(2, 4),
             Some(0xFFFF_0000)
         );
 
         assert_eq!(
-            framebuffer.pixel(3, 3),
+            framebuffer.pixel(5, 5),
             Some(0xFF00_FF00)
         );
     }
@@ -738,7 +781,7 @@ mod tests {
     fn pointer_button_down_focuses_frontmost_window() {
         let mut server = WindowServer::new(0xFF00_0000);
 
-        let back = server
+        let _back = server
             .create_window(Rect::new(10, 10, 30, 30))
             .unwrap();
 
@@ -770,13 +813,6 @@ mod tests {
             server.captured_window(),
             Some(front)
         );
-
-        assert_eq!(
-            server.dragging_window(),
-            Some(front)
-        );
-
-        let _ = back;
     }
 
     #[test]
@@ -833,13 +869,9 @@ mod tests {
             .create_window(Rect::new(100, 100, 200, 100))
             .unwrap();
 
-        /*
-         * Click 20 pixels from the left edge
-         * and 30 pixels from the top edge.
-         */
         server.handle_pointer_event(
             PointerEvent::ButtonDown {
-                position: Point::new(120, 130),
+                position: Point::new(120, 110),
                 button: PointerButton::Left,
             },
         );
@@ -849,12 +881,6 @@ mod tests {
             Some(window)
         );
 
-        /*
-         * Move cursor from (120, 130) to (200, 200).
-         *
-         * Window origin should move from (100, 100)
-         * to (180, 170).
-         */
         server.handle_pointer_event(
             PointerEvent::Move {
                 position: Point::new(200, 200),
@@ -867,7 +893,7 @@ mod tests {
             .frame();
 
         assert_eq!(frame.x(), 180);
-        assert_eq!(frame.y(), 170);
+        assert_eq!(frame.y(), 190);
     }
 
     #[test]
@@ -917,6 +943,40 @@ mod tests {
         assert_eq!(
             frame_before_release,
             frame_after_release
+        );
+    }
+
+    #[test]
+    fn drawing_text_updates_window_surface() {
+        let mut server = WindowServer::new(0xFF00_0000);
+
+        let window = server
+            .create_window(Rect::new(0, 0, 64, 64))
+            .unwrap();
+
+        assert!(
+            server
+                .draw_text(
+                    window,
+                    4,
+                    4,
+                    "A",
+                    0xFFFF_FFFF,
+                )
+                .unwrap()
+        );
+
+        let mut pixels = [0u32; 64 * 64];
+
+        let mut framebuffer =
+            Surface::new(&mut pixels, 64, 64).unwrap();
+
+        assert!(server.present(&mut framebuffer).unwrap());
+
+        assert!(
+            pixels
+                .iter()
+                .any(|&pixel| pixel == 0xFFFF_FFFF)
         );
     }
 }

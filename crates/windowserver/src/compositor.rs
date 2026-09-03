@@ -13,10 +13,10 @@
 
 use crate::{geometry::Rect, surface::Surface, window::Window};
 
-/// A window together with the pixels currently attached to it.
-///
-/// Window lifetime/state ownership remains with `server.rs`; the compositor only
-/// borrows a snapshot of the layers it must present.
+// A window together with the pixels currently attached to it.
+//
+// Window lifetime/state ownership remains with `server.rs`; the compositor only
+// borrows a snapshot of the layers it must present.
 pub struct Layer<'a, 'pixels> {
     pub window: &'a Window,
     pub surface: &'a Surface<'pixels>,
@@ -28,7 +28,7 @@ impl<'a, 'pixels> Layer<'a, 'pixels> {
     }
 }
 
-/// Platform-independent software compositor.
+// Platform-independent software compositor.
 pub struct Compositor {
     background: u32,
 }
@@ -38,7 +38,7 @@ impl Compositor {
     pub const fn background(&self) -> u32 { self.background }
     pub fn set_background(&mut self, background: u32) { self.background = background; }
 
-    /// Compose `layers` in slice order: first is backmost, last is frontmost.
+    // Compose `layers` in slice order: first is backmost, last is frontmost.
     pub fn compose<'a, 'pixels>(
         &self,
         framebuffer: &mut Surface<'_>,
@@ -54,13 +54,13 @@ impl Compositor {
         }
     }
 
-    /// Begin a composition pass by clearing the damaged region.
+    // Begin a composition pass by clearing the damaged region.
     pub fn begin(&self, framebuffer: &mut Surface<'_>, damage: Rect) {
         let Some(clip) = damage.intersection(surface_rect(framebuffer)) else { return; };
         fill_rect(framebuffer, clip, self.background);
     }
 
-    /// Compose one layer into an already-initialized composition pass.
+    // Compose one layer into an already-initialized composition pass.
     pub fn compose_layer<'a, 'pixels>(
         &self,
         framebuffer: &mut Surface<'_>,

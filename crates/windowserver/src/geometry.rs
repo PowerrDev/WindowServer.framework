@@ -22,7 +22,7 @@ impl Point {
     }
 }
 
-/// An unsigned size.
+// An unsigned size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Size {
     pub width: u32,
@@ -96,5 +96,51 @@ impl Rect {
 
     pub fn translated(self, dx: i32, dy: i32) -> Self {
         Self { origin: self.origin.offset(dx, dy), size: self.size }
+    }
+
+            // Returns the center point of the rectangle.
+    pub fn center(self) -> Point {
+        Point::new(
+            self.x().saturating_add((self.width() / 2) as i32),
+            self.y().saturating_add((self.height() / 2) as i32),
+        )
+    }
+
+    // Returns true when this rectangle completely contains another rectangle.
+    pub fn contains_rect(
+        self,
+        other: Self,
+    ) -> bool {
+        if self.is_empty() || other.is_empty() {
+            return false;
+        }
+
+        i64::from(other.x()) >= i64::from(self.x())
+            && i64::from(other.y()) >= i64::from(self.y())
+            && other.right() <= self.right()
+            && other.bottom() <= self.bottom()
+    }
+
+    // Returns a rectangle inset by the given horizontal and vertical amounts.
+    //
+    // If the inset would make the rectangle empty, an empty rectangle is
+    // returned at the resulting origin.
+    pub fn inset(
+        self,
+        dx: u32,
+        dy: u32,
+    ) -> Self {
+        let horizontal = dx.saturating_mul(2);
+        let vertical = dy.saturating_mul(2);
+
+        let width = self.width().saturating_sub(horizontal);
+        let height = self.height().saturating_sub(vertical);
+
+        Self::new(
+            self.x().saturating_add(dx as i32),
+            self.y().saturating_add(dy as i32),
+            width,
+            height,
+        )
     }
 }

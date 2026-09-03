@@ -8,6 +8,7 @@
  */
 
 use crate::geometry::{Point, Rect, Size};
+use alloc::string::String;
 
 pub type WindowId = u32;
 
@@ -36,6 +37,7 @@ pub struct Window {
     id: WindowId,
     frame: Rect,
     min_size: Size,
+    title: String,
     max_size: Option<Size>,
     titlebar_height: u32,
     flags: WindowFlags,
@@ -47,6 +49,7 @@ impl Window {
             id,
             frame,
             min_size: Size::new(1, 1),
+            title: String::from("Untitled"),
             max_size: None,
             titlebar_height: 28,
             flags: WindowFlags::default(),
@@ -58,6 +61,8 @@ impl Window {
     pub const fn position(&self) -> Point { self.frame.origin }
     pub const fn size(&self) -> Size { self.frame.size }
     pub const fn flags(&self) -> WindowFlags { self.flags }
+    pub fn title(&self) -> &str { &self.title }
+    pub fn set_title(&mut self, title: impl Into<String>) { self.title = title.into(); }
     pub const fn titlebar_height(&self) -> u32 { self.titlebar_height }
 
     pub fn set_position(&mut self, position: Point) { self.frame.origin = position; }

@@ -14,7 +14,7 @@
 use crate::geometry::Point;
 use crate::window::WindowId;
 
-/// Mouse/pointer buttons understood by WindowServer.
+// Mouse/pointer buttons understood by WindowServer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerButton {
     Left,
@@ -22,7 +22,7 @@ pub enum PointerButton {
     Middle,
 }
 
-/// Logical pointer events delivered to WindowServer.
+// Logical pointer events delivered to WindowServer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerEvent {
     Move {
@@ -40,7 +40,7 @@ pub enum PointerEvent {
     },
 }
 
-/// Result returned after routing a pointer event.
+// Result returned after routing a pointer event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerResult {
     pub position: Point,
@@ -62,7 +62,7 @@ impl PointerResult {
     }
 }
 
-/// Mutable pointer state owned by WindowServer.
+// Mutable pointer state owned by WindowServer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointerState {
     position: Point,
