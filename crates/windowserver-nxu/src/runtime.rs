@@ -7,9 +7,13 @@
  *
  * Minimal NXU runtime support for the WindowServer static library.
  *
- * WindowServer.framework is linked into the NXU kernel and therefore does not
- * own a userspace allocator or panic runtime. Allocation is delegated to the
- * NXU kernel heap.
+ * windowserver-nxu links either straight into the NXU kernel (the legacy
+ * in-kernel path) or into a standalone userland WindowServer process (see
+ * frameworks/WindowServer.framework/windowserver_service.c in the nxu
+ * repo); either way it does not own its own allocator, so allocation is
+ * delegated to whichever host provides `kmalloc`/`kfree` at link time --
+ * the kernel heap for the former, a small userland arena allocator for the
+ * latter.
  */
 
 use core::{
@@ -30,9 +34,7 @@ unsafe impl GlobalAlloc for NXUAllocator {
             return core::ptr::null_mut();
         }
 
-        unsafe {
-            kmalloc(layout.size()).cast()
-        }
+        unsafe { kmalloc(layout.size()).cast() }
     }
 
     unsafe fn dealloc(
@@ -55,13 +57,4 @@ unsafe extern "C" {
     fn kmalloc(size: usize) -> *mut c_void;
 
     fn kfree(address: *mut c_void) -> bool;
-}
-
-#[panic_handler]
-fn windowserver_panic(
-    _info: &core::panic::PanicInfo,
-) -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
 }

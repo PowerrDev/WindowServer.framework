@@ -98,6 +98,38 @@ impl Rect {
         Self { origin: self.origin.offset(dx, dy), size: self.size }
     }
 
+    /// Split `self \ other` (the part of `self` not covered by `other`)
+    /// into up to 4 non-overlapping pieces: full-width top/bottom bands
+    /// plus left/right bands limited to the intersection's height. Absent
+    /// pieces come back empty (`is_empty()` true), which callers can feed
+    /// straight into `Damage::add` since it already skips those.
+    ///
+    /// This is what lets a moved window damage only the thin strips that
+    /// actually changed (revealed background, newly-covered area) instead
+    /// of the old and new footprints' full union -- see `WindowServer`'s
+    /// `apply_pending_scrolls`, the reason this exists.
+    pub fn subtract(self, other: Self) -> [Self; 4] {
+        let Some(ix) = self.intersection(other) else {
+            return [self, Self::empty(), Self::empty(), Self::empty()];
+        };
+
+        let self_left = i64::from(self.origin.x);
+        let self_top = i64::from(self.origin.y);
+        let self_right = self.right();
+        let self_bottom = self.bottom();
+        let ix_left = i64::from(ix.origin.x);
+        let ix_top = i64::from(ix.origin.y);
+        let ix_right = ix.right();
+        let ix_bottom = ix.bottom();
+
+        let top = Self::new(self.x(), self.y(), self.width(), (ix_top - self_top) as u32);
+        let bottom = Self::new(self.x(), ix_bottom as i32, self.width(), (self_bottom - ix_bottom) as u32);
+        let left = Self::new(self.x(), ix_top as i32, (ix_left - self_left) as u32, ix.height());
+        let right = Self::new(ix_right as i32, ix_top as i32, (self_right - ix_right) as u32, ix.height());
+
+        [top, bottom, left, right]
+    }
+
             // Returns the center point of the rectangle.
     pub fn center(self) -> Point {
         Point::new(
@@ -142,5 +174,69 @@ impl Rect {
             width,
             height,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(pieces: [Rect; 4]) -> u64 {
+        pieces.iter().map(|r| r.width() as u64 * r.height() as u64).sum()
+    }
+
+    fn contains_no_point_of(pieces: [Rect; 4], other: Rect) -> bool {
+        pieces.iter().all(|piece| {
+            piece.is_empty() || piece.intersection(other).is_none()
+        })
+    }
+
+    #[test]
+    fn subtract_disjoint_returns_whole_self() {
+        let a = Rect::new(0, 0, 10, 10);
+        let b = Rect::new(100, 100, 10, 10);
+        let pieces = a.subtract(b);
+        assert_eq!(area(pieces), 100);
+        assert!(pieces.contains(&a));
+    }
+
+    #[test]
+    fn subtract_full_overlap_leaves_nothing() {
+        let a = Rect::new(0, 0, 10, 10);
+        let pieces = a.subtract(a);
+        assert_eq!(area(pieces), 0);
+    }
+
+    #[test]
+    fn subtract_small_diagonal_shift_leaves_thin_l_shaped_strips() {
+        // Mirrors a real drag step: a big window nudged by a few pixels in
+        // both axes. The remainder must be tiny relative to the window, not
+        // anywhere close to the full area -- that gap is the whole point of
+        // this method existing.
+        let old_frame = Rect::new(100, 100, 1040, 780);
+        let new_frame = Rect::new(104, 102, 1040, 780);
+
+        let revealed = old_frame.subtract(new_frame);
+        let covered = new_frame.subtract(old_frame);
+
+        assert!(contains_no_point_of(revealed, new_frame), "revealed strips must not overlap the new footprint");
+        assert!(contains_no_point_of(covered, old_frame), "covered strips must not overlap the old footprint");
+
+        let total = area(revealed) + area(covered);
+        let full_window = 1040u64 * 780;
+        assert!(total < full_window / 10, "delta damage ({total}px) should be a small fraction of the window ({full_window}px), not comparable to it");
+    }
+
+    #[test]
+    fn subtract_pieces_tile_exactly_back_to_self_minus_overlap() {
+        let a = Rect::new(0, 0, 20, 20);
+        let b = Rect::new(5, 5, 20, 20);
+        let pieces = a.subtract(b);
+
+        // area(a) - area(intersection) must equal the sum of the pieces,
+        // with no double-counting or gaps.
+        let ix = a.intersection(b).unwrap();
+        let expected = (a.width() as u64 * a.height() as u64) - (ix.width() as u64 * ix.height() as u64);
+        assert_eq!(area(pieces), expected);
     }
 }

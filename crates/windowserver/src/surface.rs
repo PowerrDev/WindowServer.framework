@@ -20,6 +20,8 @@ use crate::geometry::{
 pub enum SurfaceError {
     InvalidDimensions,
     BufferTooSmall,
+    /// No memory for the pixels.
+    OutOfMemory,
 }
 
 impl fmt::Display for SurfaceError {
@@ -34,6 +36,10 @@ impl fmt::Display for SurfaceError {
 
             Self::BufferTooSmall => {
                 f.write_str("pixel buffer is too small")
+            }
+
+            Self::OutOfMemory => {
+                f.write_str("no memory for the pixels")
             }
         }
     }

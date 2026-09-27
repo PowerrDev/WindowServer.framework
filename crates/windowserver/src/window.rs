@@ -1,45 +1,72 @@
-/*!
+#![allow(dead_code)]
+
+/**
  * Copyright (c) 2026 NXU Project. All rights reserved.
  */
-/*!
+
+/**
  * File:        crates/windowserver/src/window.rs
  *
- * Window state independent of composition, input and server ownership
+ * Window state independent of rendering and input policy.
  */
 
 use crate::geometry::{Point, Rect, Size};
-use alloc::string::String;
 
 pub type WindowId = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowFlags {
     pub visible: bool,
-    pub decorated: bool,
     pub resizable: bool,
     pub opaque: bool,
+    /// The desktop background layer: always full-screen, always at the
+    /// bottom of the stack. `WindowServer::focus_window` refuses to focus or
+    /// raise a window with this set, so clicking empty desktop space can
+    /// never bury whatever app window was on top -- see that method for the
+    /// full story.
+    pub is_background: bool,
+    /// The client's own corner radius (WindowServer draws no chrome of its
+    /// own -- see `window::Window`'s doc comment -- but the compositor's drop
+    /// shadow needs this to curve its corners the same way the client's own
+    /// `fill_rounded_rect` does, or a square shadow corner would show past a
+    /// visibly rounded window). 0 for a window that is not rounded (the
+    /// desktop background; any client that never set this).
+    pub corner_radius: u32,
+    /// The drop shadow it casts (see `compositor::ShadowStyle`).
+    pub shadow: crate::compositor::ShadowStyle,
+    /// The key window: its shadow is the darker one, as on macOS. Set by the
+    /// client (which knows which window is key), not by focus here.
+    pub key: bool,
+    /// Not `opaque`, but opaque everywhere except its rounded corners (an
+    /// app window): the rows between the corners are copied whole instead of
+    /// tested pixel by pixel.
+    pub opaque_interior: bool,
 }
 
 impl Default for WindowFlags {
     fn default() -> Self {
-        Self { visible: true, decorated: true, resizable: true, opaque: true }
+        Self {
+            visible: true,
+            resizable: true,
+            opaque: true,
+            is_background: false,
+            corner_radius: 0,
+            shadow: crate::compositor::ShadowStyle::Window,
+            key: false,
+            opaque_interior: false,
+        }
     }
 }
 
-/* `WindowServer` window
- *
- * `frame` is the complete server-side frame. Surface storage is attached later;
- * keeping geometry separate lets the compositor evolve without changing the
- * window lifecycle API.
-*/
+/// WindowServer-managed window metadata.
+///
+/// Visual appearance and client UI are owned by Aqua/UIService.
 #[derive(Debug, Clone)]
 pub struct Window {
     id: WindowId,
     frame: Rect,
     min_size: Size,
-    title: String,
     max_size: Option<Size>,
-    titlebar_height: u32,
     flags: WindowFlags,
 }
 
@@ -49,9 +76,7 @@ impl Window {
             id,
             frame,
             min_size: Size::new(1, 1),
-            title: String::from("Untitled"),
             max_size: None,
-            titlebar_height: 28,
             flags: WindowFlags::default(),
         }
     }
@@ -61,17 +86,22 @@ impl Window {
     pub const fn position(&self) -> Point { self.frame.origin }
     pub const fn size(&self) -> Size { self.frame.size }
     pub const fn flags(&self) -> WindowFlags { self.flags }
-    pub fn title(&self) -> &str { &self.title }
-    pub fn set_title(&mut self, title: impl Into<String>) { self.title = title.into(); }
-    pub const fn titlebar_height(&self) -> u32 { self.titlebar_height }
+    pub const fn max_size(&self) -> Option<Size> { self.max_size }
 
-    pub fn set_position(&mut self, position: Point) { self.frame.origin = position; }
-
-    pub fn set_frame(&mut self, frame: Rect) {
-        self.frame = Rect { origin: frame.origin, size: self.clamp_size(frame.size) };
+    pub fn set_position(&mut self, position: Point) {
+        self.frame.origin = position;
     }
 
-    pub fn set_size(&mut self, size: Size) { self.frame.size = self.clamp_size(size); }
+    pub fn set_frame(&mut self, frame: Rect) {
+        self.frame = Rect {
+            origin: frame.origin,
+            size: self.clamp_size(frame.size),
+        };
+    }
+
+    pub fn set_size(&mut self, size: Size) {
+        self.frame.size = self.clamp_size(size);
+    }
 
     pub fn set_min_size(&mut self, size: Size) {
         self.min_size = size;
@@ -83,26 +113,23 @@ impl Window {
         self.frame.size = self.clamp_size(self.frame.size);
     }
 
-    pub fn set_titlebar_height(&mut self, height: u32) { self.titlebar_height = height; }
-    pub fn set_flags(&mut self, flags: WindowFlags) { self.flags = flags; }
+    pub fn set_flags(&mut self, flags: WindowFlags) {
+        self.flags = flags;
+    }
 
-    pub fn content_rect(&self) -> Rect {
-        let top = self.titlebar_height.min(self.frame.height());
-        Rect::new(
-            self.frame.x(),
-            self.frame.y().saturating_add(top as i32),
-            self.frame.width(),
-            self.frame.height() - top,
-        )
+    pub fn set_opaque(&mut self, opaque: bool) {
+        self.flags.opaque = opaque;
     }
 
     fn clamp_size(&self, mut size: Size) -> Size {
         size.width = size.width.max(self.min_size.width);
         size.height = size.height.max(self.min_size.height);
+
         if let Some(max) = self.max_size {
             size.width = size.width.min(max.width);
             size.height = size.height.min(max.height);
         }
+
         size
     }
 }

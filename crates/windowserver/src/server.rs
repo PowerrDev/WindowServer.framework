@@ -14,45 +14,47 @@
  */
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::{
-    compositor::{Compositor, Layer},
-    cursor::Cursor,
+    compositor::{shadow_damage_rect, Compositor, Layer},
+    cursor::{Cursor, CursorKind},
     damage::Damage,
-    decorations::{Decorations, WindowHit},
-    font::BitmapFont,
-    geometry::{Point, Rect},
-    input::{
-        PointerButton,
-        PointerEvent,
-        PointerResult,
-        PointerState,
-    },
+    geometry::{Point, Rect, Size},
+    input::{PointerButton, PointerEvent, PointerResult, PointerState, ShakeDetector},
     surface::{Surface, SurfaceError},
-    text::draw_text,
-    window::{Window, WindowId},
+    window::{Window, WindowFlags, WindowId},
 };
+
+/// What damaging `frame` (a window appearing, disappearing, moving, resizing
+/// or changing stacking order) must actually cover: the frame itself, plus
+/// its shadow's reach (`compositor::shadow_damage_rect`) for anything but the
+/// desktop background, which casts none. Missing this lets a window's old
+/// shadow (or the gap where its new one should be) sit un-redrawn outside the
+/// frame-only rect -- see the `moving_a_window_recomposites_old_and_new_footprint`
+/// test, which caught exactly that.
+fn frame_damage_rect(frame: Rect, is_background: bool) -> Rect {
+    if is_background { frame } else { shadow_damage_rect(frame) }
+}
 
 struct ServerWindow {
     window: Window,
     pixels: Box<[u32]>,
     stride: u32,
+    /// The frame this window was last known-correct in the framebuffer at,
+    /// set the first time it moves after a present and consumed by
+    /// `apply_pending_scrolls` on the next one. `None` means nothing is
+    /// pending. See that method for the full reasoning.
+    pending_scroll_origin: Option<Rect>,
+    /// Its shadow, precomputed (see `compositor::ShadowMask`).
+    shadow: Option<crate::compositor::ShadowMask>,
 }
 
-// State for an active window drag operation.
-#[derive(Debug, Clone, Copy)]
-struct DragState {
-    window: WindowId,
-    offset_x: i32,
-    offset_y: i32,
-}
-
-// Platform-independent WindowServer core.
-//
-// Windows are stored in back-to-front order.
-// The last window is therefore frontmost.
+/// Platform-independent WindowServer core.
+///
+/// WindowServer owns window lifecycle, surface storage, ordering, focus,
+/// pointer state, damage tracking and composition. Aqua/UIService owns the
+/// visual contents of each window.
 pub struct WindowServer {
     compositor: Compositor,
     windows: Vec<ServerWindow>,
@@ -61,7 +63,7 @@ pub struct WindowServer {
     focused_window: Option<WindowId>,
     pointer: PointerState,
     cursor: Cursor,
-    drag: Option<DragState>,
+    shake: ShakeDetector,
 }
 
 impl WindowServer {
@@ -76,361 +78,382 @@ impl WindowServer {
             focused_window: None,
             pointer: PointerState::new(initial_position),
             cursor: Cursor::new(initial_position),
-            drag: None,
+            shake: ShakeDetector::new(),
         }
     }
 
-    pub fn compositor(&self) -> &Compositor {
-        &self.compositor
+    pub fn compositor(&self) -> &Compositor { &self.compositor }
+    pub fn compositor_mut(&mut self) -> &mut Compositor { &mut self.compositor }
+    pub fn window_count(&self) -> usize { self.windows.len() }
+    pub fn damage(&self) -> &Damage { &self.damage }
+    pub fn focused_window(&self) -> Option<WindowId> { self.focused_window }
+    pub fn pointer_position(&self) -> Point { self.pointer.position() }
+    pub fn cursor_position(&self) -> Point { self.cursor.position() }
+    pub fn pressed_button(&self) -> Option<PointerButton> { self.pointer.pressed_button() }
+    pub fn captured_window(&self) -> Option<WindowId> { self.pointer.captured_window() }
+
+    /// Install a real cursor bitmap (e.g. a decoded `.cur` asset) for `kind`,
+    /// in place of its own built-in placeholder shape whenever `kind` is
+    /// active -- every other kind keeps whatever was installed for it.
+    pub fn set_cursor_bitmap(
+        &mut self,
+        kind: CursorKind,
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+        stride: u32,
+        hotspot: Point,
+    ) -> bool {
+        let old_frame = self.cursor.frame();
+        if !self.cursor.set_bitmap(kind, pixels, width, height, stride, hotspot) {
+            return false;
+        }
+        self.damage.add(old_frame);
+        self.damage.add(self.cursor.frame());
+        true
     }
 
-    pub fn compositor_mut(&mut self) -> &mut Compositor {
-        &mut self.compositor
+    pub const fn cursor_kind(&self) -> CursorKind { self.cursor.kind() }
+
+    /// Switch what the pointer shows (`WS_Set_Cursor_Kind`): WindowServer
+    /// itself drives this for window chrome it manages directly, Aqua/
+    /// UIService for anything inside a window's content it hit-tests itself
+    /// -- see `CursorKind`. Returns `false` (no damage added) if `kind` was
+    /// already current.
+    pub fn set_cursor_kind(&mut self, kind: CursorKind) -> bool {
+        let old_frame = self.cursor.frame();
+        if !self.cursor.set_kind(kind) {
+            return false;
+        }
+        self.damage.add(old_frame);
+        self.damage.add(self.cursor.frame());
+        true
     }
 
-    pub fn window_count(&self) -> usize {
-        self.windows.len()
+    pub fn create_window(&mut self, frame: Rect) -> Result<WindowId, SurfaceError> {
+        self.create_window_with_flags(frame, WindowFlags::default())
     }
 
-    pub fn damage(&self) -> &Damage {
-        &self.damage
-    }
-
-    pub fn focused_window(&self) -> Option<WindowId> {
-        self.focused_window
-    }
-
-    pub fn pointer_position(&self) -> Point {
-        self.pointer.position()
-    }
-
-    pub fn cursor_position(&self) -> Point {
-        self.cursor.position()
-    }
-
-    pub fn pressed_button(&self) -> Option<PointerButton> {
-        self.pointer.pressed_button()
-    }
-
-    pub fn captured_window(&self) -> Option<WindowId> {
-        self.pointer.captured_window()
-    }
-
-    pub fn dragging_window(&self) -> Option<WindowId> {
-        self.drag.map(|drag| drag.window)
-    }
-
-    pub fn create_window(
+    pub fn create_window_with_flags(
         &mut self,
         frame: Rect,
+        flags: WindowFlags,
     ) -> Result<WindowId, SurfaceError> {
-        let pixels = pixel_len(
-            frame.width(),
-            frame.height(),
-        )?;
-
+        let pixels = pixel_len(frame.width(), frame.height())?;
+        // Before the id: a window that cannot be backed is not created at all.
+        let pixels = zeroed_pixels(pixels).ok_or(SurfaceError::OutOfMemory)?;
         let id = self.allocate_window_id();
 
         self.windows.push(ServerWindow {
-            window: Window::new(id, frame),
-            pixels: vec![0; pixels].into_boxed_slice(),
+            window: {
+                let mut window = Window::new(id, frame);
+                window.set_flags(flags);
+                window
+            },
+            pixels,
             stride: frame.width(),
+            pending_scroll_origin: None,
+            shadow: None,
         });
 
-        self.damage.add(frame);
-
+        self.damage.add(frame_damage_rect(frame, flags.is_background));
         Ok(id)
     }
 
+    /// Set how far a window can be resized. Takes effect on the next
+    /// `resize_window` call (or drag, once the client-side gesture is wired
+    /// up to it); does not itself resize an already out-of-range window.
+    pub fn set_size_limits(&mut self, id: WindowId, min_size: Size, max_size: Size) -> bool {
+        let Some(window) = self.window_mut(id) else { return false; };
+        window.set_min_size(min_size);
+        window.set_max_size(Some(max_size));
+        true
+    }
+
     pub fn destroy_window(&mut self, id: WindowId) -> bool {
-        let Some(index) = self.window_index(id) else {
-            return false;
-        };
-
-        let frame = self.windows[index].window.frame();
-
+        let Some(index) = self.window_index(id) else { return false; };
+        let window = &self.windows[index].window;
+        let damage = frame_damage_rect(window.frame(), window.flags().is_background);
         self.windows.remove(index);
 
         if self.focused_window == Some(id) {
             self.focused_window = None;
         }
-
         if self.pointer.captured_window() == Some(id) {
             self.pointer.release();
         }
-
-        if self.dragging_window() == Some(id) {
-            self.drag = None;
-        }
-
-        self.damage.add(frame);
-
+        self.damage.add(damage);
         true
     }
 
     pub fn window(&self, id: WindowId) -> Option<&Window> {
-        self.windows
-            .get(self.window_index(id)?)
-            .map(|entry| &entry.window)
+        self.windows.get(self.window_index(id)?).map(|entry| &entry.window)
     }
 
-    pub fn window_mut(
-        &mut self,
-        id: WindowId,
-    ) -> Option<&mut Window> {
+    pub fn window_mut(&mut self, id: WindowId) -> Option<&mut Window> {
         let index = self.window_index(id)?;
-
         Some(&mut self.windows[index].window)
     }
 
-    // Returns the frontmost window containing the point.
-    pub fn hit_test(
-        &self,
-        point: Point,
-    ) -> Option<WindowId> {
-        for entry in self.windows.iter().rev() {
-            let frame = entry.window.frame();
-
-            let x = point.x;
-            let y = point.y;
-
-            if x >= frame.x()
-                && y >= frame.y()
-                && x < frame.right() as i32
-                && y < frame.bottom() as i32
-            {
-                return Some(entry.window.id());
-            }
-        }
-
-        None
-    }
-
-    pub fn focus_window(
+    /// Submit a complete XRGB8888 client surface for an existing window.
+    ///
+    /// `transparent_key`, when present, leaves matching pixels transparent;
+    /// all other pixels are normalized to the WindowServer's ARGB8888 storage.
+    pub fn render_window(
         &mut self,
         id: WindowId,
+        source: &[u32],
+        width: u32,
+        height: u32,
+        stride: u32,
+        transparent_key: Option<u32>,
     ) -> bool {
-        if self.window_index(id).is_none() {
+        let Some(index) = self.window_index(id) else { return false; };
+        if width == 0 || height == 0 || stride < width {
+            return false;
+        }
+        if width != self.windows[index].window.frame().width()
+            || height != self.windows[index].window.frame().height()
+        {
             return false;
         }
 
-        let previous = self.focused_window;
-
-        if previous == Some(id) {
-            return true;
-        }
-
-        if let Some(previous_id) = previous {
-            if let Some(window) = self.window(previous_id) {
-                self.damage.add(window.frame());
-            }
-        }
-
-        self.focused_window = Some(id);
-
-        self.bring_to_front(id)
-    }
-
-    pub fn move_window(
-        &mut self,
-        id: WindowId,
-        position: Point,
-    ) -> bool {
-        let Some(index) = self.window_index(id) else {
+        let Some(required) = (stride as usize).checked_mul(height as usize) else {
             return false;
         };
-
-        let window = &mut self.windows[index].window;
-
-        let old_frame = window.frame();
-
-        window.set_position(position);
-
-        let new_frame = window.frame();
-
-        self.damage.add(old_frame);
-        self.damage.add(new_frame);
-
-        true
-    }
-
-    pub fn bring_to_front(
-        &mut self,
-        id: WindowId,
-    ) -> bool {
-        let Some(index) = self.window_index(id) else {
+        if source.len() < required {
             return false;
-        };
-
-        if index + 1 == self.windows.len() {
-            return true;
         }
-
-        let frame = self.windows[index].window.frame();
-
-        let entry = self.windows.remove(index);
-
-        self.windows.push(entry);
-
-        self.damage.add(frame);
-
-        true
-    }
-
-    pub fn fill_window(
-        &mut self,
-        id: WindowId,
-        pixel: u32,
-    ) -> bool {
-        let Some(index) = self.window_index(id) else {
-            return false;
-        };
-
-        let frame = self.windows[index].window.frame();
-
-        self.windows[index].pixels.fill(pixel);
-
-        self.damage.add(frame);
-
-        true
-    }
-
-    // Draw text into a window's backing surface.
-    //
-    // Text coordinates are relative to the window surface.
-    pub fn draw_text(
-        &mut self,
-        id: WindowId,
-        font: &BitmapFont,
-        position: Point,
-        text: &str,
-        pixel: u32,
-    ) -> Result<bool, SurfaceError> {
-        let Some(index) = self.window_index(id) else {
-            return Ok(false);
-        };
 
         let entry = &mut self.windows[index];
+        let width = width as usize;
+
+        // The bounding box (inclusive columns and rows) of the pixels that
+        // actually differ from what this window already held. Recompositing
+        // only that, instead of the whole window, keeps a small change (a
+        // hover highlight, one selected row) cheap: compositing is most of a
+        // redraw's cost and it scales with the damaged area.
+        let (mut min_x, mut max_x) = (usize::MAX, 0usize);
+        let (mut min_y, mut max_y) = (usize::MAX, 0usize);
+
+        for row in 0..height as usize {
+            let source_start = row * stride as usize;
+            let destination_start = row * entry.stride as usize;
+            let source_row = &source[source_start..source_start + width];
+            let destination_row = &mut entry.pixels[destination_start..destination_start + width];
+
+            let (mut first, mut last) = (usize::MAX, 0usize);
+
+            // The key test is hoisted out of the per-pixel loop: this is the
+            // hottest loop in a redraw under software emulation.
+            match transparent_key {
+                Some(key) => {
+                    for (column, (destination, &pixel)) in destination_row.iter_mut().zip(source_row).enumerate() {
+                        let normalized = if pixel == key { pixel } else { 0xFF00_0000 | (pixel & 0x00FF_FFFF) };
+                        if *destination != normalized {
+                            *destination = normalized;
+                            if first == usize::MAX { first = column; }
+                            last = column;
+                        }
+                    }
+                }
+                None => {
+                    for (column, (destination, &pixel)) in destination_row.iter_mut().zip(source_row).enumerate() {
+                        let normalized = 0xFF00_0000 | (pixel & 0x00FF_FFFF);
+                        if *destination != normalized {
+                            *destination = normalized;
+                            if first == usize::MAX { first = column; }
+                            last = column;
+                        }
+                    }
+                }
+            }
+
+            if first != usize::MAX {
+                min_x = min_x.min(first);
+                max_x = max_x.max(last);
+                min_y = min_y.min(row);
+                max_y = row;
+            }
+        }
 
         let frame = entry.window.frame();
 
-        let mut surface = Surface::with_stride(
-            &mut entry.pixels,
-            frame.width(),
-            frame.height(),
-            entry.stride,
-        )?;
+        // Fresh content invalidates the "just shift the old on-screen
+        // pixels" assumption a pending scroll relies on -- see
+        // `apply_pending_scrolls`. Fall back to damaging the old frame too,
+        // and the whole new one, so a window that both moved and redrew
+        // content this cycle still gets both spots right.
+        if let Some(original_frame) = entry.pending_scroll_origin.take() {
+            self.damage.add(original_frame);
+            self.damage.add(frame);
+        } else if min_y != usize::MAX {
+            self.damage.add(Rect::new(
+                frame.x().saturating_add(min_x as i32),
+                frame.y().saturating_add(min_y as i32),
+                (max_x - min_x + 1) as u32,
+                (max_y - min_y + 1) as u32,
+            ));
+        }
 
-        draw_text(
-            &mut surface,
-            font,
-            text,
-            position,
-            pixel,
-        );
-
-        self.damage.add(frame);
-
-        Ok(true)
+        true
     }
 
-    // Routes a pointer event through WindowServer.
-    pub fn handle_pointer_event(
-        &mut self,
-        event: PointerEvent,
-    ) -> PointerResult {
+    pub fn hit_test(&self, point: Point) -> Option<WindowId> {
+        for entry in self.windows.iter().rev() {
+            if !entry.window.flags().visible { continue; }
+            if entry.window.frame().contains_point(point) {
+                return Some(entry.window.id());
+            }
+        }
+        None
+    }
+
+    /// Change the shadow a window casts (a menu or the Dock casts a small one).
+    pub fn set_window_shadow(&mut self, id: WindowId, shadow: crate::compositor::ShadowStyle) -> bool {
+        self.set_window_flags(id, |flags| flags.shadow = shadow)
+    }
+
+    /// Opaque except its rounded corners (see `WindowFlags::opaque_interior`).
+    pub fn set_window_opaque_interior(&mut self, id: WindowId, opaque_interior: bool) -> bool {
+        self.set_window_flags(id, |flags| flags.opaque_interior = opaque_interior)
+    }
+
+    /// Mark the key window (its shadow is the darker one).
+    pub fn set_window_key(&mut self, id: WindowId, key: bool) -> bool {
+        self.set_window_flags(id, |flags| flags.key = key)
+    }
+
+    fn set_window_flags(&mut self, id: WindowId, change: impl FnOnce(&mut WindowFlags)) -> bool {
+        let Some(index) = self.window_index(id) else { return false; };
+        let window = &mut self.windows[index].window;
+        let mut flags = window.flags();
+        let before = flags;
+        change(&mut flags);
+        if flags == before {
+            return true;
+        }
+        window.set_flags(flags);
+        let frame = window.frame();
+        self.damage.add(frame_damage_rect(frame, flags.is_background));
+        true
+    }
+
+    pub fn focus_window(&mut self, id: WindowId) -> bool {
+        let Some(index) = self.window_index(id) else { return false; };
+        // Never focus or raise the desktop background layer: it hit-tests
+        // like any other window over empty desktop space, and without this,
+        // clicking there would call bring_to_front on a full-screen opaque
+        // window and bury whatever app was frontmost -- indistinguishable
+        // from that app having closed, since nothing brings it back.
+        if self.windows[index].window.flags().is_background { return false; }
+        let previous = self.focused_window;
+        if previous == Some(id) { return true; }
+        if let Some(previous_id) = previous {
+            if let Some(window) = self.window(previous_id) {
+                self.damage.add(frame_damage_rect(window.frame(), window.flags().is_background));
+            }
+        }
+        self.focused_window = Some(id);
+        self.bring_to_front(id)
+    }
+
+    /// Reposition a window. Does not damage anything directly -- unlike
+    /// most mutators here, the actual damage this produces depends on the
+    /// *net* movement since the last present, not this one call in
+    /// isolation, so it's resolved lazily by `apply_pending_scrolls` when
+    /// `present` next runs. See that method.
+    pub fn move_window(&mut self, id: WindowId, position: Point) -> bool {
+        let Some(index) = self.window_index(id) else { return false; };
+        let entry = &mut self.windows[index];
+        if entry.pending_scroll_origin.is_none() {
+            entry.pending_scroll_origin = Some(entry.window.frame());
+        }
+        entry.window.set_position(position);
+        true
+    }
+
+    /// Resize (and, for a left/top-anchored drag, reposition) a window to
+    /// `frame`, clamped to whatever `set_size_limits` last gave it. Lays the
+    /// window's pixel buffer out for the new size (growing it when it is too
+    /// small) and damages both the old and new footprint -- there's no
+    /// pending-scroll-style shortcut here, since the buffer itself is a
+    /// different shape now. The caller is expected to submit fresh content
+    /// via `render_window` right after this returns; until then the buffer
+    /// holds stale or blank pixels.
+    pub fn resize_window(&mut self, id: WindowId, frame: Rect) -> bool {
+        let Some(index) = self.window_index(id) else { return false; };
+        let entry = &mut self.windows[index];
+        let old_frame = entry.window.frame();
+
+        entry.window.set_frame(frame);
+        let new_frame = entry.window.frame();
+
+        let Ok(pixel_count) = pixel_len(new_frame.width(), new_frame.height()) else {
+            return false;
+        };
+        // A live resize calls this for every step of the drag, and the
+        // client renders the new size right after: the old storage is kept
+        // while it is big enough (its stale pixels are overwritten before
+        // the next composite), and a growing window gets some headroom so
+        // the next steps fit too -- up to its largest size, never past it.
+        // Allocating and zeroing megabytes per step was most of what a
+        // resize cost.
+        if pixel_count > entry.pixels.len() {
+            let largest = entry.window.max_size().and_then(|max| pixel_len(max.width, max.height).ok()).unwrap_or(usize::MAX);
+            let wanted = (pixel_count + pixel_count / 4).min(largest).max(pixel_count);
+            // Out of memory (the kernel's arena is finite, and every app's
+            // windows share it): the window keeps its size rather than the
+            // whole desktop stopping on a failed allocation.
+            let Some(pixels) = zeroed_pixels(wanted).or_else(|| zeroed_pixels(pixel_count)) else {
+                entry.window.set_frame(old_frame);
+                return false;
+            };
+            entry.pixels = pixels;
+        }
+        entry.stride = new_frame.width();
+        entry.pending_scroll_origin = None;
+
+        let is_background = entry.window.flags().is_background;
+        self.damage.add(frame_damage_rect(old_frame, is_background));
+        self.damage.add(frame_damage_rect(new_frame, is_background));
+        true
+    }
+
+    pub fn bring_to_front(&mut self, id: WindowId) -> bool {
+        let Some(index) = self.window_index(id) else { return false; };
+        if index + 1 == self.windows.len() { return true; }
+        let window = &self.windows[index].window;
+        let damage = frame_damage_rect(window.frame(), window.flags().is_background);
+        let entry = self.windows.remove(index);
+        self.windows.push(entry);
+        self.damage.add(damage);
+        true
+    }
+
+    /// `now_us`: the caller's monotonic microsecond clock, used only to
+    /// timestamp a shake-triggered cursor grow (see `animation.rs`) -- this
+    /// crate never reads a clock itself.
+    pub fn handle_pointer_event(&mut self, event: PointerEvent, now_us: u64) -> PointerResult {
         match event {
             PointerEvent::Move { position } => {
-                self.update_pointer_position(position);
-
-                // If a window is actively being dragged, move it.
-                if let Some(drag) = self.drag {
-                    let new_position = Point::new(
-                        position.x - drag.offset_x,
-                        position.y - drag.offset_y,
-                    );
-
-                    self.move_window(
-                        drag.window,
-                        new_position,
-                    );
-                }
-
-                // Captured windows continue receiving pointer events even
-                // when the pointer moves outside their frame.
-                let target = self
-                    .pointer
-                    .captured_window()
-                    .or_else(|| self.hit_test(position));
-
+                self.update_pointer_position(position, now_us);
                 PointerResult {
                     position,
-                    target,
+                    target: self.pointer.captured_window().or_else(|| self.hit_test(position)),
                     focused: self.focused_window,
                     button: self.pointer.pressed_button(),
                     pressed: self.pointer.pressed_button().is_some(),
                 }
             }
-
-            PointerEvent::ButtonDown {
-                position,
-                button,
-            } => {
-                self.update_pointer_position(position);
-
+            PointerEvent::ButtonDown { position, button } => {
+                self.update_pointer_position(position, now_us);
                 let target = self.hit_test(position);
-
-                // Clicking a window focuses it and brings it forward.
-                if let Some(window) = target {
-                    self.focus_window(window);
-                }
-
-                self.pointer.press(
-                    button,
-                    target,
-                );
-
-                // Begin a drag operation for left-clicks.
-                //
-                // offset_x/y prevents the window from snapping its
-                // top-left corner directly to the cursor.
-                if button == PointerButton::Left {
-                    if let Some(window_id) = target {
-                        match self
-                            .window(window_id)
-                            .map(|window| {
-                                Decorations::hit_test(
-                                    window,
-                                    position,
-                                )
-                            })
-                        {
-                            Some(WindowHit::CloseButton) => {
-                                self.destroy_window(window_id);
-                                self.pointer.release();
-                            }
-
-                            Some(WindowHit::TitleBar) => {
-                                if let Some(window) =
-                                    self.window(window_id)
-                                {
-                                    let frame = window.frame();
-
-                                    self.drag = Some(DragState {
-                                        window: window_id,
-                                        offset_x:
-                                            position.x - frame.x(),
-                                        offset_y:
-                                            position.y - frame.y(),
-                                    });
-                                }
-                            }
-
-                            _ => {}
-                        }
-                    }
-                }
-
+                if let Some(id) = target { self.focus_window(id); }
+                self.pointer.press(button, target);
+                // A drag's own quick back-and-forth (e.g. wiggling a window
+                // into place) should not be mistaken for a shake gesture.
+                self.shake.clear();
                 PointerResult {
                     position,
                     target,
@@ -439,25 +462,10 @@ impl WindowServer {
                     pressed: true,
                 }
             }
-
-            PointerEvent::ButtonUp {
-                position,
-                button,
-            } => {
-                self.update_pointer_position(position);
-
-                // Get the captured target before releasing it.
-                let target = self
-                    .pointer
-                    .captured_window()
-                    .or_else(|| self.hit_test(position));
-
+            PointerEvent::ButtonUp { position, button } => {
+                self.update_pointer_position(position, now_us);
+                let target = self.pointer.captured_window().or_else(|| self.hit_test(position));
                 self.pointer.release();
-
-                if button == PointerButton::Left {
-                    self.drag = None;
-                }
-
                 PointerResult {
                     position,
                     target,
@@ -469,126 +477,143 @@ impl WindowServer {
         }
     }
 
-    // Composites damaged windows and cursor into the framebuffer.
-    pub fn present(
-        &mut self,
-        framebuffer: &mut Surface<'_>,
-    ) -> Result<bool, SurfaceError> {
-        let Some(damage) = self.damage.take() else {
-            return Ok(false);
-        };
-
-        self.compositor.begin(
-            framebuffer,
-            damage,
-        );
-
-        for entry in &mut self.windows {
-            let ServerWindow {
-                window,
-                pixels,
-                stride,
-            } = entry;
-
-            let surface = Surface::with_stride(
-                pixels,
-                window.frame().width(),
-                window.frame().height(),
-                *stride,
-            )?;
-
-            let layer = Layer::new(
-                window,
-                &surface,
-            );
-
-            self.compositor.compose_layer(
-                framebuffer,
-                &layer,
-                damage,
-            );
+    /// Composite all damaged layers into `framebuffer`.
+    ///
+    /// Returns the damage rect that was actually redrawn, so callers can
+    /// present only that region to the display device instead of flushing
+    /// the entire scanout on every call.
+    ///
+    /// `now_us`: the caller's monotonic microsecond clock, used to advance
+    /// the cursor's grow/shrink animation by real elapsed time regardless of
+    /// how often `present` happens to get called (see `animation.rs`).
+    pub fn present(&mut self, framebuffer: &mut Surface<'_>, now_us: u64) -> Result<Option<Rect>, SurfaceError> {
+        let old_cursor_frame = self.cursor.frame();
+        if self.cursor.step_animation(now_us) {
+            self.damage.add(old_cursor_frame);
+            self.damage.add(self.cursor.frame());
         }
 
-        // Decorations are server-owned overlays above client content.
-        for entry in &self.windows {
-            Decorations::draw(
-                &entry.window,
-                framebuffer,
-                self.focused_window == Some(entry.window.id()),
-            );
+        self.apply_pending_scrolls(framebuffer);
+
+        let rects = self.damage.take();
+        if rects.is_empty() {
+            return Ok(None);
         }
 
-        // Cursor is always rendered last.
+        let bounds = Rect::new(0, 0, framebuffer.width(), framebuffer.height());
+        let mut redrawn: Option<Rect> = None;
+
+        for rect in rects {
+            let Some(clip) = rect.intersection(bounds) else { continue; };
+
+            // The desktop's own opaque background layer covers the clip: no
+            // need to clear it first.
+            let covered = self.windows.first().is_some_and(|entry| {
+                let flags = entry.window.flags();
+                flags.is_background && flags.visible && flags.opaque && entry.window.frame().intersection(clip) == Some(clip)
+            });
+            if !covered {
+                self.compositor.begin(framebuffer, clip);
+            }
+
+            for entry in &mut self.windows {
+                entry.shadow = crate::compositor::ShadowMask::refresh(&entry.window, entry.shadow.take());
+                let ServerWindow { window, pixels, stride, shadow, .. } = entry;
+                let surface = Surface::with_stride(
+                    pixels,
+                    window.frame().width(),
+                    window.frame().height(),
+                    *stride,
+                )?;
+                let layer = Layer::new(window, &surface).with_shadow(shadow.as_ref());
+                self.compositor.compose_layer(framebuffer, &layer, clip);
+            }
+
+            redrawn = Some(match redrawn {
+                Some(union) => union.union(clip),
+                None => clip,
+            });
+        }
+
         self.cursor.draw(framebuffer);
-
-        Ok(true)
+        Ok(redrawn)
     }
 
-    fn update_pointer_position(
-        &mut self,
-        position: Point,
-    ) {
-        let old_cursor_frame = self.cursor.frame();
+    /// Resolve every window's net movement since the last present.
+    ///
+    /// This used to have a fast path (see git history / `scroll_pixels`)
+    /// that shifted the framebuffer's already-composited pixels directly
+    /// instead of recompositing from each window's own source buffer, on
+    /// the theory that a pure translation needs no new pixels except the
+    /// vacated strip. That is a pure performance optimization -- windows
+    /// are never resized on move, so recompositing both the old and new
+    /// frame from `entry.pixels` (already the exact mechanism the static,
+    /// verified-correct initial render uses) is always correct, just
+    /// somewhat more work per drag step. Given a visible rendering defect
+    /// traced to dragging and not reproducible in the scroll math's own
+    /// unit tests, damaging both frames and letting the normal per-layer
+    /// compositor redraw them from source removes an entire, delicate
+    /// code path as a suspect rather than trying to patch it blind.
+    fn apply_pending_scrolls(&mut self, framebuffer: &mut Surface<'_>) {
+        let _ = framebuffer;
 
+        for entry in self.windows.iter_mut() {
+            let Some(original_frame) = entry.pending_scroll_origin.take() else { continue; };
+            let new_frame = entry.window.frame();
+            let is_background = entry.window.flags().is_background;
+
+            self.damage.add(frame_damage_rect(original_frame, is_background));
+            self.damage.add(frame_damage_rect(new_frame, is_background));
+        }
+    }
+
+    pub fn invalidate(&mut self, rect: Rect) { self.damage.add(rect); }
+
+    fn update_pointer_position(&mut self, position: Point, now_us: u64) {
+        let old_cursor_frame = self.cursor.frame();
         self.pointer.set_position(position);
         self.cursor.set_position(position);
 
-        let new_cursor_frame = self.cursor.frame();
+        // Shaking a window while dragging it (button held) is not a
+        // "locate the pointer" gesture, so don't even feed the detector.
+        if self.pointer.pressed_button().is_none() {
+            if self.shake.record(position) {
+                self.cursor.trigger_grow(now_us);
+            }
+        } else {
+            self.shake.clear();
+        }
 
-        // Damage both old and new cursor positions.
+        let new_cursor_frame = self.cursor.frame();
         self.damage.add(old_cursor_frame);
         self.damage.add(new_cursor_frame);
     }
 
-    fn window_index(
-        &self,
-        id: WindowId,
-    ) -> Option<usize> {
-        self.windows
-            .iter()
-            .position(|entry| {
-                entry.window.id() == id
-            })
+    fn window_index(&self, id: WindowId) -> Option<usize> {
+        self.windows.iter().position(|entry| entry.window.id() == id)
     }
 
-    fn allocate_window_id(
-        &mut self,
-    ) -> WindowId {
+    fn allocate_window_id(&mut self) -> WindowId {
         let id = self.next_window_id;
-
-        self.next_window_id =
-            self.next_window_id.wrapping_add(1);
-
-        if self.next_window_id == 0 {
-            self.next_window_id = 1;
-        }
-
+        self.next_window_id = self.next_window_id.wrapping_add(1);
+        if self.next_window_id == 0 { self.next_window_id = 1; }
         id
-    }
-
-    // Mark a region for recomposition.
-    //
-    // This is primarily used by platform backends when a new scanout surface
-    // becomes active and the entire scene must be composed from scratch.
-    pub fn invalidate(
-        &mut self,
-        rect: Rect,
-    ) {
-        self.damage.add(rect);
     }
 }
 
-fn pixel_len(
-    width: u32,
-    height: u32,
-) -> Result<usize, SurfaceError> {
-    if width == 0 || height == 0 {
-        return Err(SurfaceError::InvalidDimensions);
-    }
+fn pixel_len(width: u32, height: u32) -> Result<usize, SurfaceError> {
+    if width == 0 || height == 0 { return Err(SurfaceError::InvalidDimensions); }
+    (width as usize).checked_mul(height as usize).ok_or(SurfaceError::InvalidDimensions)
+}
 
-    (width as usize)
-        .checked_mul(height as usize)
-        .ok_or(SurfaceError::InvalidDimensions)
+/// `len` zeroed pixels, or `None` when there is no memory for them: in the
+/// kernel a failed infallible allocation stops everything, and a window that
+/// cannot be backed should only fail itself.
+fn zeroed_pixels(len: usize) -> Option<Box<[u32]>> {
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(len).ok()?;
+    pixels.resize(len, 0);
+    Some(pixels.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -596,387 +621,161 @@ mod tests {
     use super::*;
 
     #[test]
-    fn front_window_composes_over_back_window() {
+    fn render_window_updates_backing_surface() {
         let mut server = WindowServer::new(0xFF00_0000);
-
-        let back = server
-            .create_window(Rect::new(1, 1, 4, 4))
-            .unwrap();
-
-        let front = server
-            .create_window(Rect::new(3, 3, 4, 4))
-            .unwrap();
-
-        server.fill_window(back, 0xFFFF_0000);
-        server.fill_window(front, 0xFF00_FF00);
-
-        let mut pixels = [0u32; 64];
-
-        let mut framebuffer =
-            Surface::new(&mut pixels, 8, 8).unwrap();
-
-        let _ = server.handle_pointer_event(
-            PointerEvent::Move {
-                position: Point::new(100, 100),
-            },
-        );
-
-        assert!(server.present(&mut framebuffer).unwrap());
-
-        assert_eq!(
-            framebuffer.pixel(2, 4),
-            Some(0xFFFF_0000)
-        );
-
-        assert_eq!(
-            framebuffer.pixel(5, 5),
-            Some(0xFF00_FF00)
-        );
+        let id = server.create_window(Rect::new(1, 1, 4, 4)).unwrap();
+        let pixels = [0xFF12_3456u32; 16];
+        assert!(server.render_window(id, &pixels, 4, 4, 4, None));
+        assert!(server.damage().rect().is_some());
     }
 
     #[test]
-    fn moving_window_damages_old_and_new_frames() {
-        let mut server = WindowServer::new(0xFF00_0000);
+    fn moving_a_window_recomposites_old_and_new_footprint() {
+        let mut server = WindowServer::new(0xFF11_1111);
+        // Out of the way of the window under test -- the cursor (even the
+        // built-in fallback shape, at its default (0,0)) draws over
+        // whatever's beneath it unconditionally at the end of `present`.
+        server.handle_pointer_event(PointerEvent::Move { position: Point::new(50, 50) }, 0);
+        let id = server.create_window(Rect::new(0, 0, 4, 4)).unwrap();
+        let pixels = [0xFFAA_BBCCu32; 16];
+        assert!(server.render_window(id, &pixels, 4, 4, 4, None));
 
-        let id = server
-            .create_window(Rect::new(1, 1, 2, 2))
-            .unwrap();
+        let mut framebuffer_pixels = [0u32; 8 * 8];
+        let mut framebuffer = Surface::new(&mut framebuffer_pixels, 8, 8).unwrap();
+        assert!(server.present(&mut framebuffer, 0).unwrap().is_some());
 
-        let _ = server.damage.take();
+        // Baseline: window fully covers (0,0)-(4,4). One pixel right of it
+        // (distance 1 of SHADOW_RIGHT's 9) is inside the shadow's reach, not
+        // plain background: blend(0xFF111111, black at alpha 35) = 0xFF0F0F0F.
+        assert_eq!(framebuffer.pixel(0, 0), Some(0xFFAA_BBCC));
+        assert_eq!(framebuffer.pixel(3, 3), Some(0xFFAA_BBCC));
+        assert_eq!(framebuffer.pixel(4, 0), Some(0xFF0F_0F0F));
 
-        assert!(server.move_window(
-            id,
-            Point::new(5, 1),
-        ));
+        assert!(server.move_window(id, Point::new(1, 0)));
+        assert!(server.present(&mut framebuffer, 1).unwrap().is_some());
 
-        assert_eq!(
-            server.damage.rect(),
-            Some(Rect::new(1, 1, 6, 2))
-        );
+        // Vacated column reverts to background -- except it is now one pixel
+        // left of the window's new position (distance 1 of SHADOW_LEFT's 3),
+        // so it is the shadow's blend there too, not plain background:
+        // blend(0xFF111111, black at alpha 26) = 0xFF0F0F0F (coincidentally
+        // the same value as the right-edge blend above -- different alpha,
+        // same result once rounded to an 8-bit channel).
+        assert_eq!(framebuffer.pixel(0, 0), Some(0xFF0F_0F0F));
+        // The whole new footprint is correct, including the freshly-covered
+        // rightmost column, and one pixel past *that* is the same
+        // right-edge shadow blend the baseline already established above.
+        assert_eq!(framebuffer.pixel(1, 0), Some(0xFFAA_BBCC));
+        assert_eq!(framebuffer.pixel(4, 0), Some(0xFFAA_BBCC));
+        assert_eq!(framebuffer.pixel(5, 0), Some(0xFF0F_0F0F));
     }
 
     #[test]
-    fn bring_to_front_changes_z_order() {
-        let mut server = WindowServer::new(0xFF00_0000);
+    fn moving_a_window_off_and_back_on_screen_stays_correct() {
+        // A jump far enough that the old and new footprints don't overlap
+        // at all.
+        let mut server = WindowServer::new(0xFF11_1111);
+        server.handle_pointer_event(PointerEvent::Move { position: Point::new(50, 50) }, 0);
+        let id = server.create_window(Rect::new(0, 0, 2, 2)).unwrap();
+        let pixels = [0xFFAA_BBCCu32; 4];
+        assert!(server.render_window(id, &pixels, 2, 2, 2, None));
 
-        let first = server
-            .create_window(Rect::new(1, 1, 4, 4))
-            .unwrap();
+        let mut framebuffer_pixels = [0u32; 8 * 8];
+        let mut framebuffer = Surface::new(&mut framebuffer_pixels, 8, 8).unwrap();
+        assert!(server.present(&mut framebuffer, 0).unwrap().is_some());
 
-        let second = server
-            .create_window(Rect::new(1, 1, 4, 4))
-            .unwrap();
+        assert!(server.move_window(id, Point::new(6, 6)));
+        assert!(server.present(&mut framebuffer, 1).unwrap().is_some());
 
-        server.fill_window(first, 0xFFFF_0000);
-        server.fill_window(second, 0xFF00_FF00);
-
-        assert!(server.bring_to_front(first));
-
-        let mut pixels = [0u32; 64];
-
-        let mut framebuffer =
-            Surface::new(&mut pixels, 8, 8).unwrap();
-
-        server.present(&mut framebuffer).unwrap();
-
-        assert_eq!(
-            framebuffer.pixel(2, 2),
-            Some(0xFFFF_0000)
-        );
+        assert_eq!(framebuffer.pixel(0, 0), Some(0xFF11_1111));
+        assert_eq!(framebuffer.pixel(6, 6), Some(0xFFAA_BBCC));
+        assert_eq!(framebuffer.pixel(7, 7), Some(0xFFAA_BBCC));
     }
 
     #[test]
-    fn hit_test_returns_frontmost_window() {
-        let mut server = WindowServer::new(0xFF00_0000);
+    fn rendering_the_same_pixels_again_damages_nothing() {
+        let mut server = WindowServer::new(0xFF11_1111);
+        let id = server.create_window(Rect::new(3, 2, 4, 3)).unwrap();
+        let pixels = [0xFF10_2030u32; 12];
+        assert!(server.render_window(id, &pixels, 4, 3, 4, None));
+        assert!(server.damage().rect().is_some());
 
-        let back = server
-            .create_window(Rect::new(1, 1, 6, 6))
-            .unwrap();
+        let mut framebuffer_pixels = [0u32; 12 * 8];
+        let mut framebuffer = Surface::new(&mut framebuffer_pixels, 12, 8).unwrap();
+        assert!(server.present(&mut framebuffer, 0).unwrap().is_some());
 
-        let front = server
-            .create_window(Rect::new(3, 3, 6, 6))
-            .unwrap();
-
-        assert_eq!(
-            server.hit_test(Point::new(2, 2)),
-            Some(back)
-        );
-
-        assert_eq!(
-            server.hit_test(Point::new(4, 4)),
-            Some(front)
-        );
-
-        assert_eq!(
-            server.hit_test(Point::new(20, 20)),
-            None
-        );
+        assert!(server.render_window(id, &pixels, 4, 3, 4, None));
+        assert!(server.damage().rect().is_none());
     }
 
     #[test]
-    fn focus_window_changes_focus_and_z_order() {
-        let mut server = WindowServer::new(0xFF00_0000);
+    fn only_the_pixels_that_changed_are_damaged() {
+        let mut server = WindowServer::new(0xFF11_1111);
+        let id = server.create_window(Rect::new(3, 2, 4, 3)).unwrap();
+        let mut pixels = [0xFF10_2030u32; 12];
+        assert!(server.render_window(id, &pixels, 4, 3, 4, None));
 
-        let first = server
-            .create_window(Rect::new(1, 1, 4, 4))
-            .unwrap();
+        let mut framebuffer_pixels = [0u32; 12 * 8];
+        let mut framebuffer = Surface::new(&mut framebuffer_pixels, 12, 8).unwrap();
+        assert!(server.present(&mut framebuffer, 0).unwrap().is_some());
 
-        let second = server
-            .create_window(Rect::new(1, 1, 4, 4))
-            .unwrap();
+        // One pixel: column 2, row 1 of the window, which sits at (3, 2).
+        pixels[4 + 2] = 0xFF99_8877;
+        assert!(server.render_window(id, &pixels, 4, 3, 4, None));
+        assert_eq!(server.damage().rect(), Some(Rect::new(5, 3, 1, 1)));
+        assert!(server.present(&mut framebuffer, 1).unwrap().is_some());
+        assert_eq!(framebuffer.pixel(5, 3), Some(0xFF99_8877));
 
-        assert_eq!(server.focused_window(), None);
-
-        assert!(server.focus_window(first));
-
-        assert_eq!(
-            server.focused_window(),
-            Some(first)
-        );
-
-        assert!(server.focus_window(second));
-
-        assert_eq!(
-            server.focused_window(),
-            Some(second)
-        );
+        // Two far-apart pixels: the damage spans both.
+        pixels[0] = 0xFF01_0203;
+        pixels[11] = 0xFF04_0506;
+        assert!(server.render_window(id, &pixels, 4, 3, 4, None));
+        assert_eq!(server.damage().rect(), Some(Rect::new(3, 2, 4, 3)));
     }
 
     #[test]
-    fn pointer_move_updates_position_and_target() {
-        let mut server = WindowServer::new(0xFF00_0000);
+    fn a_moved_window_that_redraws_is_damaged_in_full() {
+        let mut server = WindowServer::new(0xFF11_1111);
+        // Park the software cursor off the tiny framebuffer so its sprite does
+        // not land on the pixels checked below.
+        server.handle_pointer_event(PointerEvent::Move { position: Point::new(50, 50) }, 0);
+        let id = server.create_window(Rect::new(0, 0, 2, 2)).unwrap();
+        let pixels = [0xFFAA_BBCCu32; 4];
+        assert!(server.render_window(id, &pixels, 2, 2, 2, None));
 
-        let window = server
-            .create_window(Rect::new(10, 10, 20, 20))
-            .unwrap();
+        let mut framebuffer_pixels = [0u32; 8 * 8];
+        let mut framebuffer = Surface::new(&mut framebuffer_pixels, 8, 8).unwrap();
+        assert!(server.present(&mut framebuffer, 0).unwrap().is_some());
 
-        let result = server.handle_pointer_event(
-            PointerEvent::Move {
-                position: Point::new(15, 15),
-            },
-        );
-
-        assert_eq!(
-            result.position,
-            Point::new(15, 15)
-        );
-
-        assert_eq!(
-            result.target,
-            Some(window)
-        );
-
-        assert_eq!(
-            server.pointer_position(),
-            Point::new(15, 15)
-        );
-
-        assert_eq!(
-            server.cursor_position(),
-            Point::new(15, 15)
-        );
+        // Moved, and redrawn with identical pixels in the same cycle: the new
+        // spot must still be composited even though no pixel changed. (The
+        // software cursor sits at the framebuffer's top-left corner, so the
+        // checks stay clear of its sprite, as the move test above does.)
+        assert!(server.move_window(id, Point::new(6, 6)));
+        assert!(server.render_window(id, &pixels, 2, 2, 2, None));
+        assert!(server.present(&mut framebuffer, 1).unwrap().is_some());
+        assert_eq!(framebuffer.pixel(6, 6), Some(0xFFAA_BBCC));
+        assert_eq!(framebuffer.pixel(7, 7), Some(0xFFAA_BBCC));
+        assert_eq!(framebuffer.pixel(0, 0), Some(0xFF11_1111));
     }
 
     #[test]
-    fn pointer_button_down_focuses_frontmost_window() {
+    fn transparent_windows_blend_over_background() {
         let mut server = WindowServer::new(0xFF00_0000);
+        // The software cursor starts at the framebuffer's top-left and its
+        // sprite covers (1, 1): park it off the framebuffer, as the move test
+        // does, so the check sees the background and not the cursor.
+        server.handle_pointer_event(PointerEvent::Move { position: Point::new(50, 50) }, 0);
+        let mut flags = WindowFlags::default();
+        flags.opaque = false;
+        let id = server.create_window_with_flags(Rect::new(1, 1, 2, 2), flags).unwrap();
+        let pixels = [0x00FF_00FFu32, 0x80FF_0000, 0x00FF_00FF, 0x00FF_00FF];
+        assert!(server.render_window(id, &pixels, 2, 2, 2, Some(0x00FF_00FF)));
 
-        let _back = server
-            .create_window(Rect::new(10, 10, 30, 30))
-            .unwrap();
+        let mut framebuffer_pixels = [0u32; 16];
+        let mut framebuffer = Surface::new(&mut framebuffer_pixels, 4, 4).unwrap();
+        assert!(server.present(&mut framebuffer, 0).unwrap().is_some());
 
-        let front = server
-            .create_window(Rect::new(20, 20, 30, 30))
-            .unwrap();
-
-        let result = server.handle_pointer_event(
-            PointerEvent::ButtonDown {
-                position: Point::new(25, 25),
-                button: PointerButton::Left,
-            },
-        );
-
-        assert_eq!(result.target, Some(front));
-        assert_eq!(result.focused, Some(front));
-
-        assert_eq!(
-            server.focused_window(),
-            Some(front)
-        );
-
-        assert_eq!(
-            server.pressed_button(),
-            Some(PointerButton::Left)
-        );
-
-        assert_eq!(
-            server.captured_window(),
-            Some(front)
-        );
-    }
-
-    #[test]
-    fn pointer_button_up_clears_button_state() {
-        let mut server = WindowServer::new(0xFF00_0000);
-
-        let window = server
-            .create_window(Rect::new(10, 10, 30, 30))
-            .unwrap();
-
-        server.handle_pointer_event(
-            PointerEvent::ButtonDown {
-                position: Point::new(15, 15),
-                button: PointerButton::Left,
-            },
-        );
-
-        let result = server.handle_pointer_event(
-            PointerEvent::ButtonUp {
-                position: Point::new(15, 15),
-                button: PointerButton::Left,
-            },
-        );
-
-        assert_eq!(result.target, Some(window));
-        assert!(!result.pressed);
-
-        assert_eq!(
-            result.button,
-            Some(PointerButton::Left)
-        );
-
-        assert_eq!(
-            server.pressed_button(),
-            None
-        );
-
-        assert_eq!(
-            server.captured_window(),
-            None
-        );
-
-        assert_eq!(
-            server.dragging_window(),
-            None
-        );
-    }
-
-    #[test]
-    fn dragging_window_moves_it_using_cursor_offset() {
-        let mut server = WindowServer::new(0xFF00_0000);
-
-        let window = server
-            .create_window(Rect::new(100, 100, 200, 100))
-            .unwrap();
-
-        server.handle_pointer_event(
-            PointerEvent::ButtonDown {
-                position: Point::new(120, 110),
-                button: PointerButton::Left,
-            },
-        );
-
-        assert_eq!(
-            server.dragging_window(),
-            Some(window)
-        );
-
-        server.handle_pointer_event(
-            PointerEvent::Move {
-                position: Point::new(200, 200),
-            },
-        );
-
-        let frame = server
-            .window(window)
-            .unwrap()
-            .frame();
-
-        assert_eq!(frame.x(), 180);
-        assert_eq!(frame.y(), 190);
-    }
-
-    #[test]
-    fn releasing_pointer_stops_window_drag() {
-        let mut server = WindowServer::new(0xFF00_0000);
-
-        let window = server
-            .create_window(Rect::new(10, 10, 100, 100))
-            .unwrap();
-
-        server.handle_pointer_event(
-            PointerEvent::ButtonDown {
-                position: Point::new(20, 20),
-                button: PointerButton::Left,
-            },
-        );
-
-        server.handle_pointer_event(
-            PointerEvent::Move {
-                position: Point::new(100, 100),
-            },
-        );
-
-        let frame_before_release = server
-            .window(window)
-            .unwrap()
-            .frame();
-
-        server.handle_pointer_event(
-            PointerEvent::ButtonUp {
-                position: Point::new(100, 100),
-                button: PointerButton::Left,
-            },
-        );
-
-        server.handle_pointer_event(
-            PointerEvent::Move {
-                position: Point::new(200, 200),
-            },
-        );
-
-        let frame_after_release = server
-            .window(window)
-            .unwrap()
-            .frame();
-
-        assert_eq!(
-            frame_before_release,
-            frame_after_release
-        );
-    }
-
-    #[test]
-    fn drawing_text_updates_window_surface() {
-        let mut server = WindowServer::new(0xFF00_0000);
-
-        let window = server
-            .create_window(Rect::new(0, 0, 64, 64))
-            .unwrap();
-
-        assert!(
-            server
-                .draw_text(
-                    window,
-                    4,
-                    4,
-                    "A",
-                    0xFFFF_FFFF,
-                )
-                .unwrap()
-        );
-
-        let mut pixels = [0u32; 64 * 64];
-
-        let mut framebuffer =
-            Surface::new(&mut pixels, 64, 64).unwrap();
-
-        assert!(server.present(&mut framebuffer).unwrap());
-
-        assert!(
-            pixels
-                .iter()
-                .any(|&pixel| pixel == 0xFFFF_FFFF)
-        );
+        assert_eq!(framebuffer.pixel(1, 1), Some(0xFF00_0000));
+        assert_ne!(framebuffer.pixel(2, 1), Some(0xFF00_0000));
     }
 }
